@@ -14,6 +14,7 @@
   import ConfigureASR from './components/ConfigureASR.svelte';
   import Connecting from './components/Connecting.svelte';
   import InitialChapterSelection from './components/InitialChapterSelection.svelte';
+  import IntelligentChapterDetection from './components/IntelligentChapterDetection.svelte';
   import FindBook from './components/FindBook.svelte';
   import Icon from './components/Icon.svelte';
   import LLMSetup from './components/LLMSetup.svelte';
@@ -101,6 +102,7 @@
     | 'asr_setup'
     | 'progress'
     | 'select_workflow'
+    | 'intelligent_chapter_detection'
     | 'initial_chapter_selection'
     | 'configure_asr'
     | 'chapter_editing'
@@ -129,6 +131,8 @@
       case 'audio_analysis':
       case 'vad_prep':
       case 'vad_analysis':
+      case 'vosk_analysis':
+      case 'llm_candidate_triage':
       case 'partial_scan_prep':
       case 'partial_audio_analysis':
       case 'partial_vad_analysis':
@@ -138,6 +142,8 @@
         return 'progress';
       case 'select_workflow':
         return 'select_workflow';
+      case 'intelligent_chapter_detection':
+        return 'intelligent_chapter_detection';
       case 'initial_chapter_selection':
         return 'initial_chapter_selection';
       case 'configure_asr':
@@ -555,6 +561,8 @@
         <ProgressDisplay />
       {:else if currentView === 'select_workflow'}
         <SelectWorkflow />
+      {:else if currentView === 'intelligent_chapter_detection'}
+        <IntelligentChapterDetection />
       {:else if currentView === 'initial_chapter_selection'}
         <InitialChapterSelection />
       {:else if currentView === 'configure_asr'}

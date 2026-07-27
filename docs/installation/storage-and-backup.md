@@ -2,7 +2,7 @@
 
 ## Storage Locations
 
-Achew writes to three locations: **Settings**, **Transcription Model Cache**, and **Temporary Data**.
+Achew writes to three locations: **Settings**, **Model Cache**, and **Temporary Data**.
 
 ### Settings
 
@@ -24,16 +24,17 @@ Contains user config/settings data:
 !!! warning "API keys are stored in plain text"
     `app_config.json` contains your Audiobookshelf and LLM API keys. Treat backups of it accordingly: encrypt off-site copies and do not commit to public repositories.
 
-### Transcription Model Cache
+### Model Cache
 
 !!! quote ""
     Directory location
     
-    - Linux/macOS: `~/.cache/huggingface/hub`
-    - Windows: `C:\Users\<Username>\.cache\huggingface\hub`
-    - Docker: `/root/.cache/huggingface/hub`
+    - Linux: `~/.cache/huggingface/hub` and `~/.cache/vosk`
+    - macOS: `~/.cache/huggingface/hub`
+    - Windows: `C:\Users\<Username>\.cache\huggingface\hub` and `C:\Users\<Username>\.cache\vosk`
+    - Docker: `/root/.cache/huggingface/hub` and `/root/.cache/vosk`
 
-Contains the models used for transcription (Whisper/Parakeet). These are downloaded on first use and cached for subsequent runs. This directory is safe to delete; Achew will re-download anything it needs.
+Contains the models used for transcription (Whisper/Parakeet) and, where available, intelligent chapter detection (Vosk). These are downloaded on first use and cached for subsequent runs. These directories are safe to delete; Achew will re-download anything it needs.
 
 ### Temporary Data
 

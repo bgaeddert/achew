@@ -11,6 +11,7 @@
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import CircleQuestionMark from '@lucide/svelte/icons/circle-question-mark';
   import Clock4 from '@lucide/svelte/icons/clock-4';
+  import Icon from './Icon.svelte';
 
   const NUM_BARS = 100;
   const SENSITIVITY_FADE_DURATION = 2400; // 40 minutes in seconds
@@ -37,6 +38,7 @@
   let sensitivity = $state(0);
   let showSensitivity = $state(false);
   let chapterRefs = $state<ChapterReference[]>([]);
+  let intelligentChapterDetectionAvailable = $state(false);
   let activeComparisonRef = $state<string | null>(null);
   let showUsageHints = $state(false);
   let includeUnalignedRefs = $state<Record<string, boolean>>({});
@@ -116,6 +118,7 @@
       );
       bookDuration = response.book_duration ?? 0;
       chapterRefs = response.chapter_refs ?? [];
+      intelligentChapterDetectionAvailable = response.intelligent_chapter_detection_available;
 
       includeUnalignedRefs = {};
       chapterRefs.forEach((ref) => {
@@ -191,6 +194,19 @@
       error = `Failed to select chapters: ${message}`;
       console.error('Error selecting chapters:', err);
     } finally {
+      loading = false;
+    }
+  }
+
+  async function openTimelineCleanup() {
+    if (loading) return;
+    loading = true;
+    error = null;
+    try {
+      await api.session.openIntelligentChapterDetection();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      error = `Failed to open timeline cleanup: ${message}`;
       loading = false;
     }
   }
@@ -741,6 +757,15 @@
         {/if}
       </div>
     </div>
+
+    {#if intelligentChapterDetectionAvailable}
+      <div class="timeline-cleanup-action">
+        <button class="btn btn-ai btn-sm" type="button" onclick={openTimelineCleanup} disabled={loading}>
+          <Icon name="ai" size="16" color="white" />
+          Auto-select
+        </button>
+      </div>
+    {/if}
 
     <!-- Include Unaligned Timestamps Options -->
     {#if chapterRefs.length > 0}
@@ -1346,6 +1371,31 @@
     display: flex;
     justify-content: center;
     margin-bottom: 1rem;
+  }
+
+  .timeline-cleanup-action {
+    display: flex;
+    justify-content: center;
+    margin: 1.25rem 0 0.75rem;
+  }
+
+  /* Match the established AI cleanup action in the chapter editor. */
+  .btn-ai {
+    background: linear-gradient(135deg, var(--ai-gradient-start) 0%, var(--ai-gradient-end) 100%);
+    color: white;
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 1rem 0 0.75rem;
+    font-weight: 600;
+    font-size: 0.875rem;
+    min-height: 2.25rem;
+    gap: 0.5rem;
+  }
+
+  .btn-ai:hover:not(:disabled) {
+    background: linear-gradient(135deg, var(--ai-gradient-start-hover) 0%, var(--ai-gradient-end-hover) 100%);
   }
 
   /* ── Empty / Loading States ── */

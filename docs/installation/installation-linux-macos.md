@@ -66,6 +66,8 @@ Visit <http://localhost:8000>{:target="_blank"} once the app is ready and you sh
 
 If you are on an M-series Mac, the **Parakeet MLX** and **Whisper MLX** models will be available in [Transcription Settings](../reference/transcription.md#services). These use hardware acceleration on Apple Silicon and run noticeably faster than the CPU variants.
 
+Intelligent chapter detection is not available in a native macOS install. To use it on a Mac, run Achew through [Docker](installation-docker.md).
+
 ## Next steps
 
 - [First run walkthrough](first-run.md): Connect Audiobookshelf and (optionally) configure an LLM service.

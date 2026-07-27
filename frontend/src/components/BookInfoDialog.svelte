@@ -86,15 +86,28 @@
     }
   }
 
-  // Debug-only dramatized fixture export: shown only in the Vite dev server (./dev.sh).
-  // Runs the auto-detection probe on this book and downloads a test fixture tagged with
-  // the chosen ground-truth label. The backend probe only runs at the select_workflow step.
+  // Debug-only exports: shown only in the Vite dev server (./dev.sh). The backend
+  // independently returns 404 unless DEBUG is enabled.
   const isDev = import.meta.env.DEV;
   let debugGroundTruth = $state<'standard' | 'dramatized'>('standard');
   let fixtureLoading = $state(false);
   let fixtureResult = $state<string | null>(null);
   let fixtureError = $state<string | null>(null);
+  let llmDebugLoading = $state(false);
+  let llmDebugError = $state<string | null>(null);
   let canRunFixture = $derived($session.step === 'select_workflow');
+
+  function downloadJson(data: Record<string, unknown>, filename: string) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  }
 
   async function runDramatizedFixture() {
     fixtureLoading = true;
@@ -112,20 +125,26 @@
         `(standard ${computed.standard_cue_count}, VAD ${computed.vad_cue_count}, unmatched ${computed.unmatched_notable_cues.length})`;
 
       // Download only the durable fixture.
-      const blob = new Blob([JSON.stringify(fixture, null, 2)], { type: 'application/json' });
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(url);
+      downloadJson(fixture, filename);
     } catch (err) {
       fixtureError = err instanceof Error ? err.message : String(err);
       console.error('Error exporting dramatized fixture:', err);
     } finally {
       fixtureLoading = false;
+    }
+  }
+
+  async function exportIntelligentLlmDebug() {
+    llmDebugLoading = true;
+    llmDebugError = null;
+    try {
+      const { capture, filename } = await api.session.exportIntelligentChapterDetectionDebug();
+      downloadJson(capture, filename);
+    } catch (err) {
+      llmDebugError = err instanceof Error ? err.message : String(err);
+      console.error('Error exporting intelligent-detection LLM capture:', err);
+    } finally {
+      llmDebugLoading = false;
     }
   }
 </script>
@@ -303,6 +322,29 @@
                 {/if}
                 {#if fixtureError}
                   <p class="debug-error">{fixtureError}</p>
+                {/if}
+              </div>
+
+              <div class="section debug-section">
+                <div class="section-header">
+                  <span class="section-title">Intelligent Detection LLM capture</span>
+                </div>
+                <p class="debug-hint">
+                  Downloads the latest in-memory LLM request and parsed response. Run intelligent detection or update
+                  its search terms first.
+                </p>
+                <div class="debug-controls">
+                  <button
+                    class="debug-run-btn"
+                    type="button"
+                    onclick={exportIntelligentLlmDebug}
+                    disabled={llmDebugLoading}
+                  >
+                    {llmDebugLoading ? 'Exporting…' : 'Export LLM capture'}
+                  </button>
+                </div>
+                {#if llmDebugError}
+                  <p class="debug-error">{llmDebugError}</p>
                 {/if}
               </div>
             {/if}

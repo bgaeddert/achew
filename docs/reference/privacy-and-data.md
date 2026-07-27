@@ -5,6 +5,7 @@ Achew talks to:
 - Your Audiobookshelf server for finding books and saving chapters.
 - LLM providers for AI Cleanup (optional).
 - Hugging Face to download transcription models.
+- Alpha Cephei to download the Vosk model used for intelligent chapter detection.
 - The GitHub Releases API to check for new versions of Achew.
 
 ## Audiobookshelf
@@ -27,6 +28,8 @@ No audio is sent. If you locally host and use Ollama or LM Studio as your provid
 ## Transcription
 
 Achew reaches out to Hugging Face to download any requested transcription models. **All transcription runs locally on the Achew host;** nothing is uploaded to a third party.
+
+Where available, intelligent chapter detection downloads its Vosk model from Alpha Cephei on first use. The model is cached locally, and audiobook audio is processed entirely on the Achew host. Intelligent chapter detection is unavailable in native macOS installs, but remains available when running Achew through Docker on a Mac.
 
 ## Upgrade checks
 

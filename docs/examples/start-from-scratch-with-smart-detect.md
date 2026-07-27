@@ -23,7 +23,7 @@ When detection finishes, you'll land on the *Initial Chapter Selection* screen. 
 
 When in doubt, err on the side of **more cues**. Extras are easy to delete in the editor; missing chapters are harder to find.
 
-Click **Create Chapters** when the timeline looks right.
+Click **Create Chapters** when the timeline looks right. For an English-language audiobook with too many possible pauses, you can instead use **Auto-select** to have local spoken-heading detection and a configured LLM provider narrow the candidates automatically. See [Smart Detect → Auto-select](../workflows/smart-detect.md#auto-select).
 
 ## Transcribe titles
 

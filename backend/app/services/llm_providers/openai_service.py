@@ -1,14 +1,24 @@
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import openai
 from openai.types.responses import EasyInputMessageParam, ParsedResponse
 
 from app.models.abs import Book
 
-from .base import AIService, ChapterList, IncrementalJSONParser, ModelInfo, ProviderInfo
+from .base import (
+    AIService,
+    CandidateTriageDecision,
+    CandidateTriageList,
+    ChapterList,
+    IncrementalJSONParser,
+    ModelInfo,
+    ProviderInfo,
+    VoskTermSuggestion,
+    compact_candidate_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -421,4 +431,154 @@ class OpenAIService(AIService):
             error_msg = f"Unexpected error during OpenAI processing (model: {model_id}): {str(e)}"
             logger.error(f"OpenAI unexpected error: {e}", exc_info=True)
             self._notify_progress(0, error_msg)
+            raise
+
+    async def triage_chapter_candidates(
+        self,
+        candidates: List[dict],
+        model_id: str,
+        book: Optional[Book] = None,
+        reference_terms: Optional[List[str]] = None,
+    ) -> List[CandidateTriageDecision]:
+        """Return a validated keep/reject decision for every supplied evidence row."""
+        if not candidates:
+            return []
+        try:
+            client = self._create_client()
+        except ValueError:
+            self._notify_progress(0, "OpenAI not configured")
+            raise
+
+        title = book.media.metadata.title if book and book.media else None
+        author = book.media.metadata.authorName if book and book.media else None
+        book_context = f"Book: {title} by {author}.\n" if title and author else ""
+        reference_terms = reference_terms or []
+        reference_term_context = (
+            " Reference labels: " + ", ".join(reference_terms) + ". A label plus plausible number is strong evidence."
+            if reference_terms
+            else ""
+        )
+        prompt = f"""Select real audiobook chapter boundaries. Rows are chronological [time_s,pause_s,first_word_offset_s,spoken_terms].
+{book_context}{reference_term_context}
+Return one keep boolean per row, in the same order. Keep only real structural boundaries: chapter/part plus plausible number, prologue, or epilogue. A pause or bare number alone is weak. Preserve coherent sequences. Do not invent evidence."""
+        compact_rows = compact_candidate_evidence(candidates)
+        self.last_intelligent_debug = {
+            "request": {
+                "system_prompt": prompt,
+                "candidate_evidence": candidates,
+                "compact_candidate_evidence": compact_rows,
+                "reference_terms": reference_terms,
+                "response_schema": "CandidateTriageList",
+            },
+            "response": None,
+        }
+        self._notify_progress(-1, "Sending silence and Vosk evidence to OpenAI…")
+        try:
+            stream_kwargs = {
+                "model": model_id,
+                "input": [
+                    EasyInputMessageParam(role="system", content=prompt),
+                    EasyInputMessageParam(role="user", content=json.dumps(compact_rows, separators=(",", ":"))),
+                ],
+                "text_format": CandidateTriageList,
+            }
+            effort = _reasoning_effort_for(model_id)
+            if effort is not None:
+                stream_kwargs["reasoning"] = {"effort": effort}
+            async with client.responses.stream(**stream_kwargs) as stream:
+                async for event in stream:
+                    if event.type == "response.created":
+                        self._notify_progress(-1, "Reviewing candidate evidence…")
+                response = await stream.get_final_response()
+            if response.output_parsed is None:
+                raise ValueError("OpenAI returned no candidate-triage response")
+            self._notify_progress(100, "Candidate ranking complete")
+            keep = response.output_parsed.keep
+            if len(keep) != len(candidates):
+                raise ValueError("OpenAI returned an invalid candidate decision count")
+            decisions = [
+                CandidateTriageDecision(
+                    candidate_id=str(candidate["candidate_id"]),
+                    keep=keep_candidate,
+                    priority="medium",
+                    reason="Compact structured candidate triage",
+                )
+                for candidate, keep_candidate in zip(candidates, keep)
+            ]
+            self.last_intelligent_debug["response"] = {
+                "keep": keep,
+                "decisions": [decision.model_dump() for decision in decisions],
+            }
+            return decisions
+        except Exception as e:
+            if self.last_intelligent_debug is not None:
+                self.last_intelligent_debug["error"] = str(e)
+            logger.error("OpenAI candidate triage failed: %s", e, exc_info=True)
+            raise
+
+    async def suggest_vosk_terms(
+        self,
+        reference_name: str,
+        reference_chapters: List[Dict[str, Any]],
+        existing_terms: List[str],
+        model_id: str,
+        book: Optional[Book] = None,
+    ) -> List[str]:
+        """Use structured output to return only extra individual Vosk words."""
+        client = self._create_client()
+        title = book.media.metadata.title if book and book.media else None
+        book_context = f"Book: {title}.\n" if title else ""
+        prompt = f"""You are preparing a constrained local Vosk vocabulary for spoken audiobook chapter headings.
+{book_context}Return only useful ADDITIONAL recurring structural-label words from the supplied chapter reference that may be spoken immediately AFTER a pause and BEFORE a chapter title.
+
+Rules:
+- Do not repeat any existing_vosk_terms.
+- Use lowercase individual words only; no explanations, punctuation, or generic narrative words.
+- Prefer repeated markers such as note, day, log, entry, letter, or comparable recurring section labels.
+- Do not return distinctive chapter-title words, names, places, plot vocabulary, or any one-off title term.
+- Ignore opening credits, end credits, and any other credits sections, even if their labels recur.
+- Do not invent terms not supported by the reference.
+"""
+        payload = {
+            "reference_name": reference_name,
+            "chapters": reference_chapters,
+            "existing_vosk_terms": existing_terms,
+        }
+        self.last_intelligent_debug = {
+            "request": {
+                "system_prompt": prompt,
+                "reference": payload,
+                "response_schema": "VoskTermSuggestion",
+            },
+            "response": None,
+        }
+        try:
+            request_kwargs = {
+                "model": model_id,
+                "input": [
+                    EasyInputMessageParam(role="system", content=prompt),
+                    EasyInputMessageParam(role="user", content=json.dumps(payload)),
+                ],
+                "text_format": VoskTermSuggestion,
+            }
+            effort = _reasoning_effort_for(model_id)
+            if effort is not None:
+                request_kwargs["reasoning"] = {"effort": effort}
+            response = await client.responses.parse(**request_kwargs)
+            if response.output_parsed is None:
+                raise ValueError("OpenAI returned no Vosk-term suggestions")
+            existing = {term.lower() for term in existing_terms}
+            terms = [
+                word
+                for term in response.output_parsed.terms
+                for word in re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", term.lower())
+                if word not in existing
+            ]
+            additions = list(dict.fromkeys(terms))
+            self.last_intelligent_debug["response"] = {"terms": additions}
+            return additions
+        except Exception as e:
+            if self.last_intelligent_debug is not None:
+                self.last_intelligent_debug["error"] = str(e)
+            logger.error("OpenAI Vosk-term suggestion failed: %s", e, exc_info=True)
             raise

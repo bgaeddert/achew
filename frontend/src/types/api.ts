@@ -25,6 +25,20 @@ export interface PipelineState {
   audio_info?: AudioInfo | null;
 }
 
+export interface IntelligentChapterDetectionOptions {
+  base_terms: string[];
+  chapter_refs: ChapterReference[];
+}
+
+export interface IntelligentChapterDetectionTermsResponse {
+  terms: string[];
+}
+
+export interface IntelligentChapterDetectionDebugResponse {
+  capture: Record<string, unknown>;
+  filename: string;
+}
+
 export interface StatusResponse {
   has_pipeline: boolean;
   item_id?: string;
@@ -224,6 +238,7 @@ export interface DetectedCuesResponse {
   detected_cues: DetectedCueEntry[];
   book_duration: number;
   chapter_refs: ChapterReference[];
+  intelligent_chapter_detection_available: boolean;
 }
 
 export interface NearbyCuesResponse {

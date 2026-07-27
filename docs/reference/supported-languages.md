@@ -2,7 +2,9 @@
 
 ## Smart Detect
 
-Smart Detect is language-agnostic; it works with any language. 
+Smart Detect's silence analysis and manual cue selection are language-agnostic; they work with any language.
+
+The optional **Auto-select** operation on the Initial Chapter Selection screen is English-only. It uses a local English Vosk model and English structural-word vocabulary before asking the selected LLM to review the candidate boundaries. For other languages, select cues with the regular timeline controls.
 
 ## Transcription
 

@@ -20,6 +20,9 @@ import type {
   DramatizedFixtureResponse,
   EditorSettings,
   EditorSettingsUpdateResponse,
+  IntelligentChapterDetectionDebugResponse,
+  IntelligentChapterDetectionOptions,
+  IntelligentChapterDetectionTermsResponse,
   ChapterReference,
   LLMModelsResponse,
   LLMProviderResponse,
@@ -146,6 +149,50 @@ export const session = {
       method: 'POST',
       body: { workflow, ref_id: refId, detection_mode: detectionMode, thorough },
     });
+  },
+
+  getIntelligentChapterDetectionOptions() {
+    return apiRequest<IntelligentChapterDetectionOptions>('/pipeline/intelligent-chapter-detection/options');
+  },
+
+  exportIntelligentChapterDetectionDebug() {
+    return apiRequest<IntelligentChapterDetectionDebugResponse>('/pipeline/intelligent-chapter-detection/llm-debug');
+  },
+
+  intelligentChapterDetection(
+    action: 'run' | 'skip' | 'update_terms',
+    providerId = '',
+    modelId = '',
+    options: { referenceId?: string; voskTerms?: string[]; minimumPauseSeconds?: number } = {},
+  ) {
+    return apiRequest<unknown>('/pipeline/intelligent-chapter-detection', {
+      method: 'POST',
+      body: {
+        action,
+        provider_id: providerId,
+        model_id: modelId,
+        reference_id: options.referenceId ?? '',
+        vosk_terms: options.voskTerms ?? [],
+        minimum_pause_seconds: options.minimumPauseSeconds ?? 2,
+      },
+    });
+  },
+
+  updateIntelligentSearchTerms(providerId: string, modelId: string, referenceId: string, voskTerms: string[]) {
+    return apiRequest<IntelligentChapterDetectionTermsResponse>('/pipeline/intelligent-chapter-detection', {
+      method: 'POST',
+      body: {
+        action: 'update_terms',
+        provider_id: providerId,
+        model_id: modelId,
+        reference_id: referenceId,
+        vosk_terms: voskTerms,
+      },
+    });
+  },
+
+  openIntelligentChapterDetection() {
+    return apiRequest<unknown>('/pipeline/open-intelligent-chapter-detection', { method: 'POST' });
   },
 
   exportDramatizedFixture(groundTruth: 'standard' | 'dramatized') {

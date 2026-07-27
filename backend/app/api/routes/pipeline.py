@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.models.references import ChapterReference, TitleReference
 from app.services.processing_pipeline import PipelineProgress
+from app.services.vosk_candidate_service import TERMS, is_vosk_available
 
 from ...app import get_app_state
 from ...core.config import get_settings, is_abs_configured
@@ -53,6 +54,25 @@ class PreassignedTitle(BaseModel):
 class ConfigureASRRequest(BaseModel):
     action: str  # "transcribe" or "skip"
     preassigned_titles: List[PreassignedTitle] = []
+
+
+class IntelligentChapterDetectionRequest(BaseModel):
+    action: Literal["run", "skip", "update_terms"]
+    provider_id: str = ""
+    model_id: str = ""
+    reference_id: str = ""
+    vosk_terms: List[str] = []
+    minimum_pause_seconds: float = 2.0
+
+
+class IntelligentChapterDetectionOptionsResponse(BaseModel):
+    base_terms: List[str]
+    chapter_refs: List[ChapterReference]
+
+
+def _require_intelligent_chapter_detection() -> None:
+    if not is_vosk_available():
+        raise HTTPException(status_code=404, detail="Intelligent chapter detection is not available on this platform")
 
 
 class PipelineStateResponse(BaseModel):
@@ -340,6 +360,130 @@ async def export_dramatized_fixture(request: DramatizedFixtureRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get(
+    "/pipeline/intelligent-chapter-detection/options", response_model=IntelligentChapterDetectionOptionsResponse
+)
+async def get_intelligent_chapter_detection_options():
+    """Return the editable default Vosk grammar and available chapter references."""
+    _require_intelligent_chapter_detection()
+    app_state = get_app_state()
+    pipeline = app_state.pipeline
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+        raise HTTPException(status_code=400, detail="Pipeline is not ready for intelligent chapter detection")
+    return IntelligentChapterDetectionOptionsResponse(base_terms=TERMS, chapter_refs=pipeline.chapter_refs)
+
+
+@router.get("/pipeline/intelligent-chapter-detection/llm-debug")
+async def export_intelligent_chapter_detection_llm_debug():
+    """DEBUG-only: export the latest in-memory intelligent-detection LLM exchange."""
+    if not get_settings().DEBUG:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    app_state = get_app_state()
+    pipeline = app_state.pipeline
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="No active pipeline")
+    if not pipeline._intelligent_llm_debug:
+        raise HTTPException(status_code=404, detail="No intelligent-detection LLM capture is available")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return {
+        "capture": pipeline._intelligent_llm_debug,
+        "filename": f"intelligent_detection_llm_debug_{timestamp}.json",
+    }
+
+
+@router.post("/pipeline/intelligent-chapter-detection")
+async def intelligent_chapter_detection(
+    request: IntelligentChapterDetectionRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Run or bypass the optional Vosk and LLM chapter-candidate triage step."""
+    try:
+        _require_intelligent_chapter_detection()
+        app_state = get_app_state()
+        pipeline = app_state.pipeline
+        if not pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        if pipeline.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+            raise HTTPException(status_code=400, detail="Pipeline is not ready for intelligent chapter detection")
+
+        if request.action == "skip":
+            await pipeline.skip_intelligent_chapter_detection()
+            return {"message": "Skipped intelligent chapter detection"}
+
+        # Keep the picker consistent with AI cleanup: the last provider/model
+        # selected for intelligent detection becomes the default next time the
+        # page is opened, including after an LLM retry.
+        from ...core.config import get_app_config, save_llm_config
+
+        config = get_app_config()
+        config.llm.last_used_provider = request.provider_id
+        config.llm.last_used_model = request.model_id
+        if not save_llm_config(config.llm):
+            raise HTTPException(status_code=500, detail="Failed to save LLM provider and model preference")
+        pipeline.ai_options.provider_id = request.provider_id
+        pipeline.ai_options.model_id = request.model_id
+
+        if request.action == "update_terms":
+            terms = await pipeline.suggest_intelligent_vosk_terms(
+                request.provider_id,
+                request.model_id,
+                request.reference_id,
+                request.vosk_terms,
+            )
+            return {"terms": terms}
+
+        async def run_detection():
+            try:
+                await pipeline.run_intelligent_chapter_detection(
+                    request.provider_id,
+                    request.model_id,
+                    request.vosk_terms,
+                    request.minimum_pause_seconds,
+                )
+            except Exception as e:
+                logger.error("Intelligent chapter detection failed: %s", e, exc_info=True)
+                pipeline.step = Step.INTELLIGENT_CHAPTER_DETECTION
+                await app_state.broadcast_step_change(
+                    Step.INTELLIGENT_CHAPTER_DETECTION,
+                    error_message=f"Intelligent chapter detection failed: {e}",
+                )
+
+        background_tasks.add_task(run_detection)
+        return {"message": "Intelligent chapter detection started"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to start intelligent chapter detection: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/pipeline/open-intelligent-chapter-detection")
+async def open_intelligent_chapter_detection():
+    """Open the optional Vosk/LLM timeline cleanup page from initial selection."""
+    try:
+        _require_intelligent_chapter_detection()
+        app_state = get_app_state()
+        pipeline = app_state.pipeline
+        if not pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        if pipeline.step != Step.INITIAL_CHAPTER_SELECTION:
+            raise HTTPException(
+                status_code=400, detail="Timeline cleanup is only available from initial chapter selection"
+            )
+        await pipeline._transition_to_intelligent_chapter_detection()
+        return {"message": "Opened intelligent chapter detection"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to open intelligent chapter detection: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/pipeline/detected-cues")
 async def get_detected_cues():
     """Get all detected cues for initial chapter selection"""
@@ -366,6 +510,7 @@ async def get_detected_cues():
             "detected_cues": detected_cues,
             "book_duration": app_state.pipeline.book_duration,
             "chapter_refs": app_state.pipeline.chapter_refs,
+            "intelligent_chapter_detection_available": is_vosk_available(),
         }
 
     except HTTPException:
@@ -563,6 +708,19 @@ async def cancel_step():
                 "message": "Processing cancelled, returned to workflow selection",
                 "action": "restarted",
                 "restart_step": RestartStep.SELECT_WORKFLOW.value,
+            }
+
+        elif step in [Step.VOSK_ANALYSIS, Step.LLM_CANDIDATE_TRIAGE]:
+            # Intelligent detection is optional and sits on top of a completed
+            # silence scan.  Cancelling it must preserve that scan and return
+            # to its own form, rather than falling through to the generic
+            # workflow reset.
+            await pipeline.cancel_processing()
+            await pipeline._transition_to_intelligent_chapter_detection()
+            return {
+                "message": "Intelligent chapter detection cancelled, returned to its configuration",
+                "action": "restarted",
+                "restart_step": Step.INTELLIGENT_CHAPTER_DETECTION.value,
             }
 
         elif step == Step.AUDIO_EXTRACTION:

@@ -90,7 +90,7 @@ In the chapter editor, transcription instead runs in the background. The editor 
 
 ## Model downloads
 
-Transcription models are downloaded on first use and are cached for subsequent runs. First runs can take several minutes for large models. See [Storage and Backup](../installation/storage-and-backup.md#transcription-model-cache).
+Transcription models are downloaded on first use and are cached for subsequent runs. First runs can take several minutes for large models. See [Storage and Backup](../installation/storage-and-backup.md#model-cache).
 
 ## `legacy-cpu` Docker image
 

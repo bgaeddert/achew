@@ -20,9 +20,10 @@ services:
       # Configuration files
       - ./config:/achew/app/config
 
-      # HuggingFace model cache (OPTIONAL but recommended)
-      # Prevents re-downloading large ASR models after image updates
+      # Model caches (OPTIONAL but recommended)
+      # Prevents re-downloading ASR and intelligent-detection models after image updates
       - ./cache:/root/.cache/huggingface/hub
+      - ./cache/vosk:/root/.cache/vosk
 
       # Temporary audio files used during processing (OPTIONAL)
       # If you have a lot of available RAM (8GB+), mapping this to shared memory

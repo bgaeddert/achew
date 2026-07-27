@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -63,6 +63,56 @@ CHAPTERS_RESPONSE_FORMAT = {
         "schema": CHAPTERS_SCHEMA,
     },
 }
+
+
+class CandidateTriageDecision(BaseModel):
+    candidate_id: str
+    keep: bool
+    priority: Literal["high", "medium", "low"]
+    reason: str
+
+
+class CandidateTriageList(BaseModel):
+    """Compact native-structured response for ICS candidate adjudication.
+
+    Candidate ordering is part of the request contract, so returning an ID,
+    priority, and prose reason for every row only burns tokens.  The pipeline
+    restores IDs locally after validating this list's length.
+    """
+
+    keep: list[bool]
+
+
+class VoskTermSuggestion(BaseModel):
+    terms: list[str]
+
+
+def compact_candidate_evidence(candidates: List[Dict[str, Any]]) -> List[List[Any]]:
+    """Serialize ICS evidence as compact chronological tuples for an LLM.
+
+    Each tuple is ``[time_s, pause_s, first_word_offset_s, spoken_terms]``.
+    Vosk has already restricted words to a small window around the pause, so
+    per-word end times, confidences, and derived flags add tokens without
+    adding independent adjudication evidence.
+    """
+    compact: List[List[Any]] = []
+    for candidate in candidates:
+        terms = str(candidate.get("spoken_terms", "")).strip()
+        if not terms:
+            # Keep this tolerant of older debug fixtures while every live ICS
+            # caller supplies the prejoined phrase.
+            terms = " ".join(
+                str(word.get("word", "")) for word in candidate.get("structural_words", []) if word.get("word")
+            )
+        compact.append(
+            [
+                int(round(float(candidate["timestamp_seconds"]))),
+                round(float(candidate["silence_seconds"]), 1),
+                round(float(candidate.get("first_word_offset_seconds", 0.0)), 1),
+                terms,
+            ]
+        )
+    return compact
 
 
 class IncrementalJSONParser:
@@ -149,6 +199,7 @@ class AIService(ABC):
         self.config = config
         self._saved_config = {}
         self._enabled = False  # Default to disabled
+        self.last_intelligent_debug: Optional[Dict[str, Any]] = None
 
     def _notify_progress(self, percent: float, message: str = ""):
         """Notify progress via callback"""
@@ -337,3 +388,153 @@ Rules for processing chapter titles:
     ) -> List[Optional[str]]:
         """Refine chapter titles using the LLM"""
         pass
+
+    async def triage_chapter_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        model_id: str,
+        book: Optional[Book] = None,
+        reference_terms: Optional[List[str]] = None,
+    ) -> List[CandidateTriageDecision]:
+        """Rank silence/Vosk evidence using the provider's standard JSON path.
+
+        Providers with a stronger native structured-output API can override
+        this (as OpenAI does). The fallback deliberately reuses the existing
+        chapter-title JSON contract, so every configured provider can take
+        part without needing a provider-specific implementation.
+        """
+        if not candidates:
+            return []
+
+        candidate_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+        compact_rows = compact_candidate_evidence(candidates)
+        # The shared chapter-title path is the compatibility fallback for
+        # providers without native structured output.  Give it terse markers
+        # to return-or-null instead of escaped copies of full Vosk JSON.
+        evidence_rows = [
+            f"{index}|{time_s}|{pause_s:g}|{offset_s:g}|{terms}"
+            for index, (time_s, pause_s, offset_s, terms) in enumerate(compact_rows)
+        ]
+        reference_terms = reference_terms or []
+        instructions = [
+            "This is chapter-boundary triage, not title cleanup. Inputs are chronological "
+            "`index|time_s|pause_s|first_word_offset_s|spoken_terms` markers. Return each marker unchanged only "
+            "when it is a real chapter or part boundary; otherwise return null. A pause alone or bare number is weak. "
+            "Prefer chapter/part plus a plausible number, prologue, or epilogue. Preserve coherent sequences. "
+            "Do not invent or remove rows.",
+        ]
+        if reference_terms:
+            instructions.append(
+                "The following terms were selected from a chapter reference as recurring structural labels: "
+                + ", ".join(reference_terms)
+                + ". Treat one of these labels paired with a plausible spoken number at a pause as strong chapter "
+                "evidence, even when Vosk did not recognize the word 'chapter'."
+            )
+        system_prompt = self._build_system_prompt(
+            deselect_non_chapters=True,
+            infer_opening_credits=False,
+            infer_end_credits=False,
+            additional_instructions=instructions,
+            book=book,
+        )
+        self.last_intelligent_debug = {
+            "request": {
+                "system_prompt": system_prompt,
+                "candidate_evidence": candidates,
+                "compact_candidate_evidence": compact_rows,
+                "reference_terms": reference_terms,
+            },
+            "response": None,
+        }
+        try:
+            title_results = await self.process_chapter_titles(
+                evidence_rows,
+                model_id=model_id,
+                additional_instructions=instructions,
+                deselect_non_chapters=True,
+                infer_opening_credits=False,
+                infer_end_credits=False,
+                book=book,
+            )
+            if len(title_results) != len(candidates):
+                raise ValueError("The LLM returned an invalid candidate count")
+            decisions = [
+                CandidateTriageDecision(
+                    candidate_id=candidate_id,
+                    keep=bool(result and str(result).strip().lower() != "null"),
+                    priority="medium",
+                    reason="Provider candidate triage",
+                )
+                for candidate_id, result in zip(candidate_ids, title_results)
+            ]
+            self.last_intelligent_debug["response"] = {
+                "parsed_title_results": title_results,
+                "decisions": [decision.model_dump() for decision in decisions],
+            }
+            return decisions
+        except Exception as e:
+            self.last_intelligent_debug["error"] = str(e)
+            raise
+
+    async def suggest_vosk_terms(
+        self,
+        reference_name: str,
+        reference_chapters: List[Dict[str, Any]],
+        existing_terms: List[str],
+        model_id: str,
+        book: Optional[Book] = None,
+    ) -> List[str]:
+        """Suggest additional individual Vosk grammar words from a chapter reference.
+
+        Providers without a native JSON implementation reuse the established
+        chapter-title contract: the single returned title is a space-separated
+        list of terms.  The caller normalizes and merges it with the base list.
+        """
+        reference_payload = {
+            "reference_name": reference_name,
+            "chapters": reference_chapters,
+            "existing_vosk_terms": existing_terms,
+        }
+        instructions = [
+            "You are preparing a constrained local Vosk vocabulary for detecting spoken audiobook chapter headings. "
+            "Identify only useful ADDITIONAL recurring structural label words likely to be spoken immediately AFTER a "
+            "pause and BEFORE a chapter title: for example, note, day, log, entry, letter, or similar repeated section "
+            "markers. Do NOT return distinctive chapter-title words, character names, place names, plot words, or one-off "
+            "title vocabulary. Ignore opening credits, end credits, and any other credits sections even if they recur. "
+            "Do not repeat existing_vosk_terms. Do not include explanations, punctuation, or prose. "
+            "Return one lowercase space-separated list of words in the single title value; return an empty title when no "
+            "additions are useful.",
+        ]
+        system_prompt = self._build_system_prompt(
+            deselect_non_chapters=False,
+            infer_opening_credits=False,
+            infer_end_credits=False,
+            additional_instructions=instructions,
+            book=book,
+        )
+        self.last_intelligent_debug = {
+            "request": {
+                "system_prompt": system_prompt,
+                "reference": reference_payload,
+                "response_schema": "space-separated Vosk terms",
+            },
+            "response": None,
+        }
+        try:
+            result = await self.process_chapter_titles(
+                [json.dumps(reference_payload, separators=(",", ":"))],
+                model_id=model_id,
+                additional_instructions=instructions,
+                deselect_non_chapters=False,
+                infer_opening_credits=False,
+                infer_end_credits=False,
+                book=book,
+            )
+            term_text = result[0] if result else ""
+            terms = re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", (term_text or "").lower())
+            additions = [term for term in terms if term not in {word.lower() for word in existing_terms}]
+            self.last_intelligent_debug["response"] = {"terms": additions}
+            return list(dict.fromkeys(additions))
+        except Exception as e:
+            self.last_intelligent_debug["error"] = str(e)
+            raise

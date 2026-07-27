@@ -33,7 +33,7 @@ The Smart Detect workflow finds chapter cues by analyzing the audio itself. This
 3. Choose a **Detection** mode. **Auto** (the default) samples a small portion of the audio to decide for you. Pick **Standard** for plain narration, or **Dramatized** for books that contain music or sound effects. Dramatized detection takes much longer, so Auto only switches to it if necessary.
 4. *(Optional)* Add or inspect existing [Chapter References](../getting-started/chapter-references.md) from this screen. These can be used for comparison once detection finishes.
 5. Click **Start Smart Detect**, and Achew will begin analyzing the audio. This process can take anywhere from a few seconds to several minutes depending on the length of the book, how powerful your machine is, and which **Detection** mode was used.
-6. After detection has finished, use the **Initial Chapter Selection** screen (see below) to decide which cues will become chapters, then click **Create Chapters**.
+6. After detection has finished, use the **Initial Chapter Selection** screen (see below) to decide which cues will become chapters. Select them manually and click **Create Chapters**, or optionally use **Auto-select** for English-language audio.
 7. On the **Transcribe Titles** screen, choose your [transcription settings](../reference/transcription.md). If you have a [Reference](../getting-started/chapter-references.md) whose chapter timestamps line up with any of your chosen cues, you can optionally enable **Use aligned titles from** to pick and choose titles to use directly without transcribing them. See [Using aligned titles](../reference/transcription.md#using-aligned-titles) for details.
 8. Click **Transcribe Titles**. The first few seconds of audio at each chapter timestamp will be transcribed into a title.
 9. After transcription has finished, use the [Chapter Editor](../editor/index.md) to review and polish the chapters.
@@ -95,6 +95,16 @@ The **Intro/Outro Sensitivity** slider adjusts how likely it is that cues near t
 /// caption
 Example timeline comparison between low and high sensitivity
 ///
+
+### Auto-select
+
+For English-language audiobooks with too many possible pauses, **Auto-select** can narrow the detected cues automatically. It uses a local, English-only Vosk model to check the strongest pauses for spoken structural words such as “chapter,” “part,” and numbers. Your selected LLM provider then reviews the recognized words and pause information to choose the most likely chapter boundaries.
+
+Auto-select requires a configured and enabled [LLM provider](../getting-started/setup-llm-providers.md). The Vosk model is downloaded on first use and cached locally. Audio remains on the Achew host; only book context, candidate timestamps, pause lengths, and recognized words are sent to the selected LLM provider.
+
+The **Advanced** section lets you adjust the minimum pause length and the English words Vosk listens for. If you have a Chapter Reference, **Update Search Terms** can ask the selected LLM to suggest additional recurring structural words. This sends the Reference name, chapter titles and timestamps, and current search terms to that provider.
+
+Auto-select is optional. You can return to the regular cue-selection controls without losing the original detected cues. It is unavailable in native macOS installations, but remains available when Achew runs through Docker on a Mac.
 
 ### Including Unaligned Chapters
 

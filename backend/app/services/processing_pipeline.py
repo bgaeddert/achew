@@ -15,7 +15,12 @@ from app.app import get_app_state
 from app.models.abs import AudioFile, AudioInfo, Book
 
 from ..core.config import get_app_config, get_settings
-from ..core.constants import BOOK_END_IGNORE_WINDOW, REALIGN_PADDING_DEFAULT, REALIGN_PADDING_EXPANDED
+from ..core.constants import (
+    BOOK_END_IGNORE_WINDOW,
+    CHAPTER_START_PADDING,
+    REALIGN_PADDING_DEFAULT,
+    REALIGN_PADDING_EXPANDED,
+)
 from ..core.system_info import get_worker_count
 from ..models.ai_options import AIOptions
 from ..models.chapter import ChapterData, RealignmentData
@@ -36,6 +41,7 @@ from .chapter_aligner import ChapterAligner
 from .dramatized_detection import SAMPLE_WINDOW_SECONDS, DramatizedAnalysis, classify_dramatized
 from .reference_parsers import csv_parser, cue_parser, epub_parser, json_parser, mobi_parser, text_parser
 from .vad_detection_service import VadDetectionService
+from .vosk_candidate_service import TERMS, CandidateEvidence, VoskCandidateService, normalize_vosk_terms
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,7 @@ def _silent_progress(step: Step, percent: float, message: str = "", details: Opt
 
 # Message shown during auto-probe for dramatized
 DRAMATIZED_PROBE_MESSAGE = "Detecting dramatized audio…"
+MIN_INTELLIGENT_SILENCE_SECONDS = 2.0
 
 
 class ProcessingError(Exception):
@@ -76,6 +83,7 @@ class ProcessingPipeline:
         self._download_task = None
         self._vad_task = None
         self._ai_cleanup_task: Optional[asyncio.Task] = None
+        self._intelligent_detection_task: Optional[asyncio.Task] = None
         self.is_realignment: bool = False
         self.is_quick_edit: bool = False
 
@@ -125,6 +133,13 @@ class ProcessingPipeline:
 
         self.detected_cues: List[DetectedCue] = []
         self.initial_chapter_selection_available: bool = False  # True only after smart-detect populates detected_cues
+        # Vosk is the expensive local stage. Keep its complete evidence while the
+        # user retries an LLM decision so a provider error never re-scans audio.
+        self._intelligent_candidates: List[DetectedCue] = []
+        self._intelligent_vosk_evidence: Optional[List[CandidateEvidence]] = None
+        self._intelligent_vosk_config: Optional[Tuple[Tuple[str, ...], float]] = None
+        self._intelligent_reference_terms: List[str] = []
+        self._intelligent_llm_debug: Optional[Dict[str, Any]] = None
 
         # Scan coverage tracking
         self.normal_scanned_regions: List[Tuple[float, float]] = []
@@ -161,6 +176,9 @@ class ProcessingPipeline:
         if self._ai_cleanup_task:
             self._ai_cleanup_task.cancel()
             self._ai_cleanup_task = None
+        if self._intelligent_detection_task:
+            self._intelligent_detection_task.cancel()
+            self._intelligent_detection_task = None
         if self._partial_scan_task:
             self._partial_scan_task.cancel()
             self._partial_scan_task = None
@@ -247,6 +265,17 @@ class ProcessingPipeline:
             except Exception as e:
                 logger.warning(f"Error waiting for AI cleanup task cancellation: {e}")
             self._ai_cleanup_task = None
+
+        if self._intelligent_detection_task:
+            logger.info("Cancelling intelligent chapter detection…")
+            self._intelligent_detection_task.cancel()
+            try:
+                await self._intelligent_detection_task
+            except asyncio.CancelledError:
+                logger.info("Intelligent chapter detection cancelled successfully")
+            except Exception as e:
+                logger.warning(f"Error waiting for intelligent chapter detection cancellation: {e}")
+            self._intelligent_detection_task = None
 
         # Cancel any running transcription tasks
         if self._transcription_task:
@@ -366,6 +395,10 @@ class ProcessingPipeline:
 
         if step_num <= RestartStep.SELECT_WORKFLOW.ordinal:
             self.detected_cues = []
+            self._intelligent_candidates = []
+            self._intelligent_vosk_evidence = None
+            self._intelligent_vosk_config = None
+            self._intelligent_reference_terms = []
             self.normal_scanned_regions = []
             self.vad_scanned_regions = []
             self.initial_chapter_selection_available = False
@@ -1499,6 +1532,236 @@ class ProcessingPipeline:
             Step.INITIAL_CHAPTER_SELECTION, 100, f"Ready for selection with {len(self.detected_cues)} detected cues"
         )
         logger.info(f"Detected {len(self.detected_cues)} cues, ready for initial chapter selection")
+
+    def _capture_intelligent_llm_debug(
+        self,
+        metadata: Dict[str, Any],
+        provider_debug: Optional[Dict[str, Any]] = None,
+        error: Optional[Exception] = None,
+    ) -> None:
+        """Keep the latest ICS LLM exchange in memory for the DEBUG export endpoint."""
+        if not get_settings().DEBUG:
+            self._intelligent_llm_debug = None
+            return
+
+        self._intelligent_llm_debug = {
+            "item_id": self.item_id,
+            **metadata,
+            **(provider_debug or {}),
+        }
+        if error is not None:
+            self._intelligent_llm_debug["error"] = str(error)
+
+    async def _transition_to_intelligent_chapter_detection(self):
+        """Pause after standard silence detection so the user can opt into Vosk/LLM triage."""
+        eligible_count = sum(cue.gap >= MIN_INTELLIGENT_SILENCE_SECONDS for cue in self.detected_cues)
+        self._notify_progress(
+            Step.INTELLIGENT_CHAPTER_DETECTION,
+            100,
+            f"Found {len(self.detected_cues)} silence candidates; {eligible_count} are at least 2 seconds for Vosk review",
+        )
+
+    async def skip_intelligent_chapter_detection(self):
+        if self.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+            raise ProcessingError("Intelligent chapter detection is not ready to skip")
+        await self._transition_to_initial_chapter_selection()
+
+    async def suggest_intelligent_vosk_terms(
+        self,
+        provider_id: str,
+        model_id: str,
+        reference_id: str,
+        current_terms: List[str],
+    ) -> List[str]:
+        """Ask the selected LLM for reference-specific Vosk words before scanning audio."""
+        if self.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+            raise ProcessingError("Intelligent chapter detection is not ready to update search terms")
+        reference = next((ref for ref in self.chapter_refs if ref.id == reference_id), None)
+        if not reference:
+            raise ProcessingError("Choose a chapter reference before updating search terms")
+
+        terms = normalize_vosk_terms(current_terms)
+        if not terms:
+            terms = list(TERMS)
+        chapters = [
+            {"timestamp_seconds": round(chapter.timestamp, 3), "title": chapter.title or ""}
+            for chapter in reference.chapters
+        ]
+        from ..services.llm_providers.registry import create_provider
+
+        provider = create_provider(provider_id, _silent_progress)
+        if provider is None:
+            raise ProcessingError(f"Unknown LLM provider: {provider_id}")
+        debug_metadata = {
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "reference_id": reference_id,
+            "purpose": "vosk_term_suggestions",
+        }
+        try:
+            additions = await provider.suggest_vosk_terms(
+                reference.name,
+                chapters,
+                terms,
+                model_id=model_id,
+                book=self.book,
+            )
+        except Exception as e:
+            self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
+            raise
+        self._intelligent_reference_terms = normalize_vosk_terms(additions)
+        self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug)
+        return normalize_vosk_terms([*terms, *additions])
+
+    async def run_intelligent_chapter_detection(
+        self,
+        provider_id: str,
+        model_id: str,
+        vosk_terms: Optional[List[str]] = None,
+        minimum_pause_seconds: float = MIN_INTELLIGENT_SILENCE_SECONDS,
+    ):
+        """Use local Vosk evidence and the selected LLM to conservatively reduce silence candidates."""
+        if self.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+            raise ProcessingError("Intelligent chapter detection is not ready to run")
+        if not provider_id or not model_id:
+            raise ProcessingError("Choose an LLM provider and model before running intelligent detection")
+
+        terms = normalize_vosk_terms(vosk_terms if vosk_terms is not None else TERMS)
+        if not terms:
+            raise ProcessingError("Enter at least one Vosk search term")
+        minimum_pause_seconds = max(2.0, min(6.0, float(minimum_pause_seconds)))
+        vosk_config = (tuple(terms), minimum_pause_seconds)
+        reference_terms = [term for term in self._intelligent_reference_terms if term in terms]
+
+        async def run() -> None:
+            try:
+                if self._intelligent_vosk_evidence is None or self._intelligent_vosk_config != vosk_config:
+                    candidates = [cue for cue in self.detected_cues if cue.gap >= minimum_pause_seconds]
+                    if not candidates:
+                        raise ProcessingError(
+                            f"No silences of at least {minimum_pause_seconds:g} seconds are available for Vosk review"
+                        )
+
+                    def vosk_progress(
+                        step: Step,
+                        percent: float,
+                        message: str = "",
+                        details: Optional[Dict[str, Any]] = None,
+                    ):
+                        self._notify_progress(Step.VOSK_ANALYSIS, percent, message, details)
+
+                    service = VoskCandidateService(
+                        progress_callback=vosk_progress,
+                        running_processes=self._running_processes,
+                        process_lock=self._process_lock,
+                        terms=terms,
+                    )
+                    anchors = [cue.timestamp + CHAPTER_START_PADDING for cue in candidates]
+                    evidence = await service.collect(self.audio_file_path, self.book_duration, anchors)
+                    if self.step != Step.VOSK_ANALYSIS:
+                        return
+                    self._intelligent_candidates = candidates
+                    self._intelligent_vosk_evidence = evidence
+                    self._intelligent_vosk_config = vosk_config
+                else:
+                    candidates = self._intelligent_candidates
+                    evidence = self._intelligent_vosk_evidence
+                    self._notify_progress(
+                        Step.LLM_CANDIDATE_TRIAGE,
+                        -1,
+                        "Reusing Vosk evidence from the previous attempt…",
+                    )
+
+                triage_rows = []
+                for index, (cue, row) in enumerate(zip(candidates, evidence), 1):
+                    # Vosk is deliberately grammar-constrained. No recognized
+                    # structural word means there is no audio evidence to send on.
+                    if not row.words:
+                        continue
+                    triage_rows.append(
+                        {
+                            "candidate_id": f"candidate-{index}",
+                            "timestamp_seconds": round(cue.timestamp, 3),
+                            "silence_seconds": round(cue.gap, 3),
+                            "first_word_offset_seconds": round(
+                                row.words[0].start - (cue.timestamp + CHAPTER_START_PADDING), 3
+                            ),
+                            "spoken_terms": " ".join(word.word for word in row.words),
+                        }
+                    )
+                if not triage_rows:
+                    raise ProcessingError(
+                        "Vosk did not recognize structural words near any eligible silence; skip to review raw silences"
+                    )
+
+                def triage_progress(
+                    _step: Step, percent: float, message: str = "", details: Optional[Dict[str, Any]] = None
+                ):
+                    self._notify_progress(Step.LLM_CANDIDATE_TRIAGE, percent, message, details)
+
+                from ..services.llm_providers.registry import create_provider
+
+                provider = create_provider(provider_id, triage_progress)
+                if provider is None:
+                    raise ProcessingError(f"Unknown LLM provider: {provider_id}")
+                # LLM response time is not measurable.  Use the existing
+                # indeterminate progress treatment instead of displaying a
+                # misleading 0% bar while the request is in flight.
+                self._notify_progress(Step.LLM_CANDIDATE_TRIAGE, -1, "Reviewing Vosk and silence evidence…")
+                debug_metadata = {
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "candidate_count": len(triage_rows),
+                }
+                try:
+                    decisions = await provider.triage_chapter_candidates(
+                        triage_rows,
+                        model_id=model_id,
+                        book=self.book,
+                        reference_terms=reference_terms,
+                    )
+                except Exception as e:
+                    self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
+                    raise
+                self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug)
+                decisions_by_id = {decision.candidate_id: decision for decision in decisions}
+                expected_ids = {row["candidate_id"] for row in triage_rows}
+                if len(decisions_by_id) != len(decisions) or set(decisions_by_id) != expected_ids:
+                    raise ProcessingError("The LLM returned an incomplete or invalid set of candidate decisions")
+
+                retained = [
+                    candidates[int(row["candidate_id"].removeprefix("candidate-")) - 1]
+                    for row in triage_rows
+                    if decisions_by_id[row["candidate_id"]].keep
+                ]
+                if not retained:
+                    raise ProcessingError(
+                        "The LLM did not retain any chapter candidates; skip instead to review raw silences"
+                    )
+
+                # ``detected_cues`` remains the complete silence scan so the
+                # editor's Add Chapter From dialog can still offer every
+                # candidate that intelligent detection declined.  ``cues`` is
+                # the existing, separate transcription queue: populate it
+                # with only the approved boundaries, just as SIC does after a
+                # manual selection.  SIC always adds the book start, so the
+                # automatic path does too.
+                self.cues = self._filter_cues_by_duration(sorted({0.0, *(cue.timestamp for cue in retained)}))
+                self._notify_progress(
+                    Step.CONFIGURE_ASR,
+                    0,
+                    f"Auto-selected {len(self.cues)} chapter boundaries; ready for transcription configuration",
+                )
+                logger.info(
+                    "Intelligent detection selected %d chapter boundaries from %d original silence candidates",
+                    len(self.cues),
+                    len(self.detected_cues),
+                )
+            finally:
+                self._intelligent_detection_task = None
+
+        self._intelligent_detection_task = asyncio.create_task(run())
+        await self._intelligent_detection_task
 
     async def _extract_audio_segments(self, preassigned_titles: Optional[Dict[int, str]] = None):
         """Extract audio segments for transcription, skipping cues with preassigned titles"""
