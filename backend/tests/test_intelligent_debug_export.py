@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.routes import pipeline as pipeline_routes
-from app.models.enums import Step
+from app.models.enums import RestartStep, Step
 from app.services import processing_pipeline
 from app.services.processing_pipeline import ProcessingPipeline
 
@@ -80,6 +80,23 @@ async def test_detected_cues_report_intelligent_detection_availability(monkeypat
     result = await pipeline_routes.get_detected_cues()
 
     assert result["intelligent_chapter_detection_available"] is False
+
+
+@pytest.mark.parametrize(
+    "step",
+    [Step.INTELLIGENT_CHAPTER_DETECTION, Step.VOSK_ANALYSIS, Step.LLM_CANDIDATE_TRIAGE],
+)
+def test_intelligent_detection_steps_offer_workflow_and_new_audiobook(monkeypatch, step):
+    pipeline = object.__new__(ProcessingPipeline)
+    pipeline.step = step
+    pipeline.initial_chapter_selection_available = True
+    monkeypatch.setattr(processing_pipeline, "is_vosk_available", lambda: True)
+
+    assert pipeline.get_restart_options() == [
+        RestartStep.INITIAL_CHAPTER_SELECTION.value,
+        RestartStep.SELECT_WORKFLOW.value,
+        RestartStep.IDLE.value,
+    ]
 
 
 def test_intelligent_debug_capture_is_kept_only_in_debug_mode(monkeypatch):

@@ -320,6 +320,9 @@
     }
     return ![
       'select_workflow',
+      'intelligent_chapter_detection',
+      'vosk_analysis',
+      'llm_candidate_triage',
       'initial_chapter_selection',
       'configure_asr',
       'chapter_editing',

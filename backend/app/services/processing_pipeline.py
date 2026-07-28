@@ -2455,6 +2455,15 @@ class ProcessingPipeline:
         match self.step:
             case Step.SELECT_WORKFLOW:
                 restart_options.append(RestartStep.IDLE)
+            case Step.INTELLIGENT_CHAPTER_DETECTION | Step.VOSK_ANALYSIS | Step.LLM_CANDIDATE_TRIAGE:
+                # Intelligent detection can run for a while. Keep the back menu
+                # available both on its configuration screen and while its Vosk/
+                # LLM stages are processing so the user can cancel and choose a
+                # different workflow or audiobook.
+                restart_options.append(RestartStep.IDLE)
+                restart_options.append(RestartStep.SELECT_WORKFLOW)
+                if self.initial_chapter_selection_available:
+                    restart_options.append(RestartStep.INITIAL_CHAPTER_SELECTION)
             case Step.INITIAL_CHAPTER_SELECTION:
                 restart_options.append(RestartStep.IDLE)
                 restart_options.append(RestartStep.SELECT_WORKFLOW)
