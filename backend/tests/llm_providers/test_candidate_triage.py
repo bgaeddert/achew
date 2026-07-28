@@ -28,5 +28,5 @@ def test_compact_candidate_evidence_reads_legacy_debug_words():
     assert compact_candidate_evidence(candidates) == [[10, 2.0, 0.0, "part one"]]
 
 
-def test_native_triage_response_is_an_ordered_boolean_list():
-    assert CandidateTriageList.model_validate({"keep": [False, True]}).keep == [False, True]
+def test_native_triage_response_is_an_accepted_id_list():
+    assert CandidateTriageList.model_validate({"accepted_ids": [0, 2]}).accepted_ids == [0, 2]

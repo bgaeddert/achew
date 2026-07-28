@@ -19,6 +19,7 @@
   import Scissors from '@lucide/svelte/icons/scissors';
   import ScissorsLineDashed from '@lucide/svelte/icons/scissors-line-dashed';
   import Settings from '@lucide/svelte/icons/settings';
+  import Sparkles from '@lucide/svelte/icons/sparkles';
 
   interface StepConfig {
     title: string;
@@ -59,6 +60,16 @@
       title: 'Scanning for Chapter Cues',
       description: 'Analyzing voice activity to detect chapter cues…',
       icon: AudioLines,
+    },
+    vosk_analysis: {
+      title: 'Checking Spoken Headings',
+      description: 'Analyzing short audio regions locally with Vosk…',
+      icon: AudioLines,
+    },
+    llm_candidate_triage: {
+      title: 'Reviewing Chapter Candidates',
+      description: 'Local Vosk analysis is complete. Waiting for the selected LLM provider (up to 2 minutes)…',
+      icon: Sparkles,
     },
     partial_scan_prep: {
       title: 'Preparing Partial Scan',
@@ -129,7 +140,7 @@
 
   async function handleCancel() {
     try {
-      const response = (await api.session.cancel()) as CancelResponse;
+      const response = (await api.session.cancel($session.step)) as CancelResponse;
       if (response.action === 'deleted') {
         session.resetToIdle();
       }

@@ -39,6 +39,10 @@ class RestartPipelineRequest(BaseModel):
     restart_step: RestartStep
 
 
+class CancelStepRequest(BaseModel):
+    expected_step: Optional[Step] = None
+
+
 class ASROptionsRequest(BaseModel):
     trim: bool
     use_bias_words: bool = False
@@ -63,6 +67,7 @@ class IntelligentChapterDetectionRequest(BaseModel):
     reference_id: str = ""
     vosk_terms: List[str] = []
     minimum_pause_seconds: float = 2.0
+    post_pause_seconds: float = 1.0
 
 
 class IntelligentChapterDetectionOptionsResponse(BaseModel):
@@ -443,6 +448,7 @@ async def intelligent_chapter_detection(
                     request.model_id,
                     request.vosk_terms,
                     request.minimum_pause_seconds,
+                    request.post_pause_seconds,
                 )
             except Exception as e:
                 logger.error("Intelligent chapter detection failed: %s", e, exc_info=True)
@@ -685,7 +691,7 @@ async def restart_pipeline(request: RestartPipelineRequest):
 
 
 @router.post("/pipeline/cancel")
-async def cancel_step():
+async def cancel_step(request: Optional[CancelStepRequest] = None):
     """Cancel the current processing pipeline step and return to the appropriate previous step"""
     try:
         app_state = get_app_state()
@@ -695,6 +701,8 @@ async def cancel_step():
             raise HTTPException(status_code=404, detail="Pipeline not found")
 
         step = pipeline.step
+        expected_step = request.expected_step if request else None
+        intelligent_steps = [Step.VOSK_ANALYSIS, Step.LLM_CANDIDATE_TRIAGE]
 
         if step in [Step.VALIDATING, Step.DOWNLOADING]:
             success = await app_state.delete_pipeline()
@@ -710,11 +718,17 @@ async def cancel_step():
                 "restart_step": RestartStep.SELECT_WORKFLOW.value,
             }
 
-        elif step in [Step.VOSK_ANALYSIS, Step.LLM_CANDIDATE_TRIAGE]:
+        elif step in intelligent_steps or (
+            expected_step in intelligent_steps
+            and step == Step.CONFIGURE_ASR
+            and pipeline._intelligent_vosk_evidence is not None
+        ):
             # Intelligent detection is optional and sits on top of a completed
             # silence scan.  Cancelling it must preserve that scan and return
-            # to its own form, rather than falling through to the generic
-            # workflow reset.
+            # to its own form. The expected-step check also closes the narrow
+            # race where the LLM finishes after the browser displays Cancel but
+            # before this request reaches the backend.
+            app_state.progress_dispatcher.increment_epoch()
             await pipeline.cancel_processing()
             await pipeline._transition_to_intelligent_chapter_detection()
             return {

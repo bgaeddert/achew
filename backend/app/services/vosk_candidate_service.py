@@ -125,6 +125,9 @@ class VoskWord:
     start: float
     end: float
     confidence: float
+    utterance: int = 0
+    utterance_start: Optional[float] = None
+    utterance_end: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -247,8 +250,13 @@ class VoskCandidateService:
             self._running_processes.append(process)
         words: List[VoskWord] = []
 
-        def collect(payload: str) -> None:
-            for row in json.loads(payload).get("result", []):
+        def collect(payload: str, utterance: int) -> None:
+            rows = json.loads(payload).get("result", [])
+            if not rows:
+                return
+            utterance_start = round(start + min(float(row["start"]) for row in rows), 3)
+            utterance_end = round(start + max(float(row["end"]) for row in rows), 3)
+            for row in rows:
                 word = str(row.get("word", "")).lower()
                 if word in self.terms:
                     words.append(
@@ -257,21 +265,26 @@ class VoskCandidateService:
                             start=round(start + float(row["start"]), 3),
                             end=round(start + float(row["end"]), 3),
                             confidence=round(float(row.get("conf", 0.0)), 3),
+                            utterance=utterance,
+                            utterance_start=utterance_start,
+                            utterance_end=utterance_end,
                         )
                     )
 
         try:
             if process.stdout is None:
                 raise RuntimeError("ffmpeg did not expose decoded audio")
+            utterance = 0
             while chunk := process.stdout.read(8000):
                 if cancelled.is_set():
                     process.terminate()
                     return []
                 if recognizer.AcceptWaveform(chunk):
-                    collect(recognizer.Result())
+                    collect(recognizer.Result(), utterance)
+                    utterance += 1
             if cancelled.is_set():
                 return []
-            collect(recognizer.FinalResult())
+            collect(recognizer.FinalResult(), utterance)
             if process.wait():
                 stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
                 raise RuntimeError(f"Vosk audio decode failed: {stderr[:500]}")
@@ -338,14 +351,17 @@ class VoskCandidateService:
         if cancelled.is_set():
             return []
 
-        # Completion order is intentionally irrelevant.  Reassemble results in
-        # time order so the evidence delivered to candidate triage is stable.
-        words = [word for result in window_words for word in (result or [])]
+        # Completion order is intentionally irrelevant. Reassemble results in
+        # time order while preserving Vosk's internal utterance boundaries.
         return [
             CandidateEvidence(
                 timestamp=anchor,
                 words=[
-                    word for word in words if anchor - GATE_BEFORE_SECONDS <= word.start <= anchor + GATE_AFTER_SECONDS
+                    word
+                    for (start, end), result in zip(windows, window_words)
+                    if start <= anchor <= end
+                    for word in (result or [])
+                    if anchor - GATE_BEFORE_SECONDS <= word.start <= anchor + GATE_AFTER_SECONDS
                 ],
             )
             for anchor in anchors

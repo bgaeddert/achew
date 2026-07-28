@@ -72,6 +72,8 @@ export interface ErrorData {
 
 export interface StatusData {
   type?: string;
+  step?: string;
+  message?: string;
   book?: unknown;
   [key: string]: unknown;
 }

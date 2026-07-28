@@ -41,7 +41,14 @@ from .chapter_aligner import ChapterAligner
 from .dramatized_detection import SAMPLE_WINDOW_SECONDS, DramatizedAnalysis, classify_dramatized
 from .reference_parsers import csv_parser, cue_parser, epub_parser, json_parser, mobi_parser, text_parser
 from .vad_detection_service import VadDetectionService
-from .vosk_candidate_service import TERMS, CandidateEvidence, VoskCandidateService, normalize_vosk_terms
+from .vosk_candidate_service import (
+    TERMS,
+    CandidateEvidence,
+    VoskCandidateService,
+    VoskWord,
+    is_vosk_available,
+    normalize_vosk_terms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,7 @@ def _silent_progress(step: Step, percent: float, message: str = "", details: Opt
 # Message shown during auto-probe for dramatized
 DRAMATIZED_PROBE_MESSAGE = "Detecting dramatized audio…"
 MIN_INTELLIGENT_SILENCE_SECONDS = 2.0
+INTELLIGENT_TRIAGE_TIMEOUT_SECONDS = 120.0
 
 
 class ProcessingError(Exception):
@@ -392,6 +400,10 @@ class ProcessingPipeline:
             self.cleanup_segment_files()
             self.cues = []
             self.step = Step.INITIAL_CHAPTER_SELECTION
+
+        if step_num <= RestartStep.INTELLIGENT_CHAPTER_DETECTION.ordinal:
+            self.cues = []
+            self.step = Step.INTELLIGENT_CHAPTER_DETECTION
 
         if step_num <= RestartStep.SELECT_WORKFLOW.ordinal:
             self.detected_cues = []
@@ -1619,6 +1631,7 @@ class ProcessingPipeline:
         model_id: str,
         vosk_terms: Optional[List[str]] = None,
         minimum_pause_seconds: float = MIN_INTELLIGENT_SILENCE_SECONDS,
+        post_pause_seconds: float = 1.0,
     ):
         """Use local Vosk evidence and the selected LLM to conservatively reduce silence candidates."""
         if self.step != Step.INTELLIGENT_CHAPTER_DETECTION:
@@ -1630,6 +1643,7 @@ class ProcessingPipeline:
         if not terms:
             raise ProcessingError("Enter at least one Vosk search term")
         minimum_pause_seconds = max(2.0, min(6.0, float(minimum_pause_seconds)))
+        post_pause_seconds = max(0.5, min(2.0, float(post_pause_seconds)))
         vosk_config = (tuple(terms), minimum_pause_seconds)
         reference_terms = [term for term in self._intelligent_reference_terms if term in terms]
 
@@ -1673,22 +1687,64 @@ class ProcessingPipeline:
                     )
 
                 triage_rows = []
+                triage_cues: Dict[str, DetectedCue] = {}
                 for index, (cue, row) in enumerate(zip(candidates, evidence), 1):
                     # Vosk is deliberately grammar-constrained. No recognized
                     # structural word means there is no audio evidence to send on.
                     if not row.words:
                         continue
+
+                    utterances_by_id: Dict[int, List[VoskWord]] = {}
+                    for word in row.words:
+                        utterances_by_id.setdefault(word.utterance, []).append(word)
+                    utterances = list(utterances_by_id.values())
+                    anchor = cue.timestamp + CHAPTER_START_PADDING
+                    primary_index = min(
+                        range(len(utterances)),
+                        key=lambda utterance_index: min(
+                            abs(word.start - anchor) for word in utterances[utterance_index]
+                        ),
+                    )
+
+                    primary_id = f"candidate-{index}"
+                    primary_words = utterances[primary_index]
+                    triage_cues[primary_id] = cue
                     triage_rows.append(
                         {
-                            "candidate_id": f"candidate-{index}",
+                            "candidate_id": primary_id,
                             "timestamp_seconds": round(cue.timestamp, 3),
                             "silence_seconds": round(cue.gap, 3),
-                            "first_word_offset_seconds": round(
-                                row.words[0].start - (cue.timestamp + CHAPTER_START_PADDING), 3
-                            ),
-                            "spoken_terms": " ".join(word.word for word in row.words),
+                            "first_word_offset_seconds": round(primary_words[0].start - anchor, 3),
+                            "spoken_terms": " ".join(word.word for word in primary_words),
                         }
                     )
+
+                    previous_words = primary_words
+                    post_index = 0
+                    for post_words in utterances[primary_index + 1 :]:
+                        previous_end = previous_words[0].utterance_end or previous_words[-1].end
+                        post_start = post_words[0].utterance_start or post_words[0].start
+                        post_pause = max(0.0, post_start - previous_end)
+                        previous_words = post_words
+                        if post_pause < post_pause_seconds:
+                            continue
+
+                        post_index += 1
+                        candidate_id = f"candidate-{index}-post-{post_index}"
+                        post_cue = DetectedCue(
+                            timestamp=max(0.0, post_start - CHAPTER_START_PADDING),
+                            gap=post_pause,
+                        )
+                        triage_cues[candidate_id] = post_cue
+                        triage_rows.append(
+                            {
+                                "candidate_id": candidate_id,
+                                "timestamp_seconds": round(post_cue.timestamp, 3),
+                                "silence_seconds": round(post_pause, 3),
+                                "first_word_offset_seconds": round(post_words[0].start - post_start, 3),
+                                "spoken_terms": " ".join(word.word for word in post_words),
+                            }
+                        )
                 if not triage_rows:
                     raise ProcessingError(
                         "Vosk did not recognize structural words near any eligible silence; skip to review raw silences"
@@ -1707,19 +1763,33 @@ class ProcessingPipeline:
                 # LLM response time is not measurable.  Use the existing
                 # indeterminate progress treatment instead of displaying a
                 # misleading 0% bar while the request is in flight.
-                self._notify_progress(Step.LLM_CANDIDATE_TRIAGE, -1, "Reviewing Vosk and silence evidence…")
+                self._notify_progress(
+                    Step.LLM_CANDIDATE_TRIAGE,
+                    -1,
+                    "Vosk analysis complete; waiting for the selected LLM to review candidate boundaries…",
+                )
                 debug_metadata = {
                     "provider_id": provider_id,
                     "model_id": model_id,
                     "candidate_count": len(triage_rows),
+                    "post_pause_seconds": post_pause_seconds,
                 }
                 try:
-                    decisions = await provider.triage_chapter_candidates(
-                        triage_rows,
-                        model_id=model_id,
-                        book=self.book,
-                        reference_terms=reference_terms,
+                    decisions = await asyncio.wait_for(
+                        provider.triage_chapter_candidates(
+                            triage_rows,
+                            model_id=model_id,
+                            book=self.book,
+                            reference_terms=reference_terms,
+                        ),
+                        timeout=INTELLIGENT_TRIAGE_TIMEOUT_SECONDS,
                     )
+                except asyncio.TimeoutError as e:
+                    self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
+                    raise ProcessingError(
+                        "LLM candidate review timed out after 2 minutes. "
+                        "Vosk results were kept; retry with a faster model."
+                    ) from e
                 except Exception as e:
                     self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
                     raise
@@ -1730,9 +1800,7 @@ class ProcessingPipeline:
                     raise ProcessingError("The LLM returned an incomplete or invalid set of candidate decisions")
 
                 retained = [
-                    candidates[int(row["candidate_id"].removeprefix("candidate-")) - 1]
-                    for row in triage_rows
-                    if decisions_by_id[row["candidate_id"]].keep
+                    triage_cues[row["candidate_id"]] for row in triage_rows if decisions_by_id[row["candidate_id"]].keep
                 ]
                 if not retained:
                     raise ProcessingError(
@@ -2382,6 +2450,7 @@ class ProcessingPipeline:
         from ..models.enums import RestartStep
 
         restart_options: List[RestartStep] = []
+        intelligent_detection_available = self.initial_chapter_selection_available and is_vosk_available()
 
         match self.step:
             case Step.SELECT_WORKFLOW:
@@ -2394,11 +2463,15 @@ class ProcessingPipeline:
                 restart_options.append(RestartStep.SELECT_WORKFLOW)
                 if self.initial_chapter_selection_available:
                     restart_options.append(RestartStep.INITIAL_CHAPTER_SELECTION)
+                if intelligent_detection_available:
+                    restart_options.append(RestartStep.INTELLIGENT_CHAPTER_DETECTION)
             case Step.CHAPTER_EDITING:
                 restart_options.append(RestartStep.IDLE)
                 restart_options.append(RestartStep.SELECT_WORKFLOW)
                 if self.initial_chapter_selection_available:
                     restart_options.append(RestartStep.INITIAL_CHAPTER_SELECTION)
+                if intelligent_detection_available:
+                    restart_options.append(RestartStep.INTELLIGENT_CHAPTER_DETECTION)
                 if not self.is_realignment and not self.is_quick_edit:
                     restart_options.append(RestartStep.CONFIGURE_ASR)
             case Step.REVIEWING | Step.COMPLETED:
@@ -2406,6 +2479,8 @@ class ProcessingPipeline:
                 restart_options.append(RestartStep.SELECT_WORKFLOW)
                 if self.initial_chapter_selection_available:
                     restart_options.append(RestartStep.INITIAL_CHAPTER_SELECTION)
+                if intelligent_detection_available:
+                    restart_options.append(RestartStep.INTELLIGENT_CHAPTER_DETECTION)
                 if not self.is_realignment and not self.is_quick_edit:
                     restart_options.append(RestartStep.CONFIGURE_ASR)
                 restart_options.append(RestartStep.CHAPTER_EDITING)

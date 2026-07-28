@@ -268,6 +268,8 @@
         return 'New Audiobook';
       case 'select_workflow':
         return 'Select Workflow';
+      case 'intelligent_chapter_detection':
+        return 'Intelligent Chapter Detection';
       case 'initial_chapter_selection':
         return 'Initial Chapter Selection';
       case 'configure_asr':
@@ -426,7 +428,9 @@
                       onclick={() => handleRestartFromStep(option)}
                       disabled={$session.loading}
                     >
-                      {#if option === 'initial_chapter_selection'}
+                      {#if option === 'intelligent_chapter_detection'}
+                        <Icon name="ai" size="16" />
+                      {:else if option === 'initial_chapter_selection'}
                         <Icon name="timeline" size="16" />
                       {:else}
                         {@const RestartIcon = getRestartOptionIcon(option)}

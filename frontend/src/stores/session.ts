@@ -203,9 +203,11 @@ function createSessionStore() {
         const data = raw as StatusData;
         console.log('WebSocket status:', data);
 
-        if (data.type === 'book_update' && data.book) {
-          update((state) => ({ ...state, book: data.book as Book }));
-        }
+        update((state) => ({
+          ...state,
+          ...(data.step ? { step: data.step } : {}),
+          ...(data.type === 'book_update' && data.book ? { book: data.book as Book } : {}),
+        }));
       }),
     );
   };

@@ -75,12 +75,12 @@ class CandidateTriageDecision(BaseModel):
 class CandidateTriageList(BaseModel):
     """Compact native-structured response for ICS candidate adjudication.
 
-    Candidate ordering is part of the request contract, so returning an ID,
-    priority, and prose reason for every row only burns tokens.  The pipeline
-    restores IDs locally after validating this list's length.
+    The model returns only accepted row IDs.  This avoids asking smaller models
+    to produce one boolean for every input row while the pipeline still
+    validates and restores the application's candidate IDs locally.
     """
 
-    keep: list[bool]
+    accepted_ids: list[int]
 
 
 class VoskTermSuggestion(BaseModel):
@@ -419,9 +419,15 @@ Rules for processing chapter titles:
         instructions = [
             "This is chapter-boundary triage, not title cleanup. Inputs are chronological "
             "`index|time_s|pause_s|first_word_offset_s|spoken_terms` markers. Return each marker unchanged only "
-            "when it is a real chapter or part boundary; otherwise return null. A pause alone or bare number is weak. "
-            "Prefer chapter/part plus a plausible number, prologue, or epilogue. Preserve coherent sequences. "
-            "Do not invent or remove rows.",
+            "when it is a real chapter or part boundary; otherwise return null. Evaluate the entire sequence "
+            "holistically, not each row in isolation. Audiobooks normally use a consistent convention: they may "
+            'announce "chapter one," "chapter two," and so on; consistently announce bare numbers without the word '
+            '"chapter"; or use structural labels such as prologue, epilogue, or part one. A bare number is weak by '
+            "itself, but becomes strong when chronological candidates form a plausible, consistent chapter-number "
+            "sequence. Reject isolated numbers that do not fit the surrounding sequence. Missing or imperfectly "
+            "recognized numbers should not invalidate an otherwise clear pattern. Use silence duration and how soon "
+            "speech occurs after the boundary only as supporting evidence; a pause alone is insufficient. Do not "
+            "invent, remove, or reorder rows.",
         ]
         if reference_terms:
             instructions.append(

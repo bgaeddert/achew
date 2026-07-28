@@ -163,7 +163,12 @@ export const session = {
     action: 'run' | 'skip' | 'update_terms',
     providerId = '',
     modelId = '',
-    options: { referenceId?: string; voskTerms?: string[]; minimumPauseSeconds?: number } = {},
+    options: {
+      referenceId?: string;
+      voskTerms?: string[];
+      minimumPauseSeconds?: number;
+      postPauseSeconds?: number;
+    } = {},
   ) {
     return apiRequest<unknown>('/pipeline/intelligent-chapter-detection', {
       method: 'POST',
@@ -174,6 +179,7 @@ export const session = {
         reference_id: options.referenceId ?? '',
         vosk_terms: options.voskTerms ?? [],
         minimum_pause_seconds: options.minimumPauseSeconds ?? 2,
+        post_pause_seconds: options.postPauseSeconds ?? 1,
       },
     });
   },
@@ -238,8 +244,11 @@ export const session = {
     });
   },
 
-  cancel() {
-    return apiRequest<CancelResponse>('/pipeline/cancel', { method: 'POST' });
+  cancel(expectedStep?: string) {
+    return apiRequest<CancelResponse>('/pipeline/cancel', {
+      method: 'POST',
+      body: expectedStep ? { expected_step: expectedStep } : undefined,
+    });
   },
 
   configureASR(action: string, preassignedTitles: PreassignedTitle[] = []) {

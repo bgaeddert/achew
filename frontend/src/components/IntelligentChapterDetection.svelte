@@ -25,6 +25,7 @@
   let baseTerms = $state<string[]>([]);
   let voskTerms = $state('');
   let minimumPauseSeconds = $state(2);
+  let postPauseSeconds = $state(1);
   let advancedExpanded = $state(false);
   let showReferenceChapters = $state(false);
   let referenceChaptersTitle = $state('');
@@ -162,6 +163,7 @@
       await api.session.intelligentChapterDetection('run', providerId, modelId, {
         voskTerms: parsedTerms(),
         minimumPauseSeconds,
+        postPauseSeconds,
       });
     } catch (error) {
       console.error('Failed to run intelligent chapter detection:', error);
@@ -332,6 +334,33 @@
                   disabled={loading || updatingTerms}
                 />
                 <div class="slider-value">{minimumPauseSeconds}s</div>
+              </div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-header">
+                <label for="post-pause">Post-Pause</label>
+                <span
+                  class="help-icon"
+                  use:tooltip={{
+                    text: 'Recognized speech after at least this gap is sent to the LLM as a separate candidate.',
+                    delay: 0,
+                  }}
+                >
+                  <CircleQuestionMark size="14" />
+                </span>
+              </div>
+              <div class="slider-container">
+                <input
+                  id="post-pause"
+                  type="range"
+                  min="0.5"
+                  max="2"
+                  step="0.5"
+                  bind:value={postPauseSeconds}
+                  class="slider"
+                  disabled={loading || updatingTerms}
+                />
+                <div class="slider-value">{postPauseSeconds}s</div>
               </div>
             </div>
           </div>
@@ -587,6 +616,9 @@
     align-items: center;
     justify-content: center;
     gap: 0.45rem;
+  }
+  .setting-item + .setting-item {
+    margin-top: 1.25rem;
   }
   .setting-header label {
     color: var(--text-primary);

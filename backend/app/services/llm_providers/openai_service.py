@@ -454,19 +454,40 @@ class OpenAIService(AIService):
         book_context = f"Book: {title} by {author}.\n" if title and author else ""
         reference_terms = reference_terms or []
         reference_term_context = (
-            " Reference labels: " + ", ".join(reference_terms) + ". A label plus plausible number is strong evidence."
+            "\nReference labels selected from the chapter reference: " + ", ".join(reference_terms) + "."
             if reference_terms
             else ""
         )
-        prompt = f"""Select real audiobook chapter boundaries. Rows are chronological [time_s,pause_s,first_word_offset_s,spoken_terms].
-{book_context}{reference_term_context}
-Return one keep boolean per row, in the same order. Keep only real structural boundaries: chapter/part plus plausible number, prologue, or epilogue. A pause or bare number alone is weak. Preserve coherent sequences. Do not invent evidence."""
+        prompt = f"""Select real audiobook chapter boundaries from chronological evidence rows formatted as:
+
+id|time_s|pause_s|first_word_offset_s|spoken_terms
+
+{book_context.rstrip()}{reference_term_context}
+
+Evaluate the entire sequence holistically, not each row in isolation.
+
+Audiobooks normally use a consistent chapter-heading convention:
+
+- Some consistently announce "chapter one," "chapter two," "chapter three," and so on.
+- Others consistently announce only the number: "one," "two," "three," and so on, without saying "chapter."
+- Special boundaries may instead be announced as "prologue," "epilogue," "part one," or similar structural labels.
+
+A bare number is weak evidence by itself, but becomes strong evidence when multiple chronological candidates form a plausible, consistent chapter-number sequence. An isolated number that does not fit the surrounding sequence is likely narrative speech and should be rejected. Missing or imperfectly recognized numbers should not invalidate an otherwise clear pattern.
+
+Use silence duration and how soon the spoken term occurs after the boundary as supporting evidence. A pause alone is not sufficient evidence.
+
+Return a JSON object containing the IDs of accepted boundaries in accepted_ids. Omitted IDs are rejected. Include each accepted ID exactly once, use only IDs present in the evidence, and do not invent evidence. Then check your work before returning the JSON object."""
         compact_rows = compact_candidate_evidence(candidates)
+        evidence_table = "\n".join(
+            f"{candidate_id}|{time_s}|{pause_s:g}|{offset_s:g}|{terms}"
+            for candidate_id, (time_s, pause_s, offset_s, terms) in enumerate(compact_rows)
+        )
         self.last_intelligent_debug = {
             "request": {
                 "system_prompt": prompt,
                 "candidate_evidence": candidates,
                 "compact_candidate_evidence": compact_rows,
+                "evidence_table": evidence_table,
                 "reference_terms": reference_terms,
                 "response_schema": "CandidateTriageList",
             },
@@ -478,7 +499,7 @@ Return one keep boolean per row, in the same order. Keep only real structural bo
                 "model": model_id,
                 "input": [
                     EasyInputMessageParam(role="system", content=prompt),
-                    EasyInputMessageParam(role="user", content=json.dumps(compact_rows, separators=(",", ":"))),
+                    EasyInputMessageParam(role="user", content=evidence_table),
                 ],
                 "text_format": CandidateTriageList,
             }
@@ -493,20 +514,23 @@ Return one keep boolean per row, in the same order. Keep only real structural bo
             if response.output_parsed is None:
                 raise ValueError("OpenAI returned no candidate-triage response")
             self._notify_progress(100, "Candidate ranking complete")
-            keep = response.output_parsed.keep
-            if len(keep) != len(candidates):
-                raise ValueError("OpenAI returned an invalid candidate decision count")
+            accepted_ids = response.output_parsed.accepted_ids
+            if len(accepted_ids) != len(set(accepted_ids)):
+                raise ValueError("OpenAI returned duplicate candidate IDs")
+            if any(candidate_id < 0 or candidate_id >= len(candidates) for candidate_id in accepted_ids):
+                raise ValueError("OpenAI returned an invalid candidate ID")
+            accepted_id_set = set(accepted_ids)
             decisions = [
                 CandidateTriageDecision(
                     candidate_id=str(candidate["candidate_id"]),
-                    keep=keep_candidate,
+                    keep=candidate_id in accepted_id_set,
                     priority="medium",
                     reason="Compact structured candidate triage",
                 )
-                for candidate, keep_candidate in zip(candidates, keep)
+                for candidate_id, candidate in enumerate(candidates)
             ]
             self.last_intelligent_debug["response"] = {
-                "keep": keep,
+                "accepted_ids": accepted_ids,
                 "decisions": [decision.model_dump() for decision in decisions],
             }
             return decisions
