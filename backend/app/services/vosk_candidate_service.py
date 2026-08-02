@@ -27,6 +27,10 @@ SAMPLE_RATE = 16_000
 BYTES_PER_SECOND = SAMPLE_RATE * 2
 GATE_BEFORE_SECONDS = 0.5
 GATE_AFTER_SECONDS = 3.0
+# A Vosk window is only a few seconds long.  Keep this generous enough for a
+# cold decoder while ensuring a malformed media region cannot hold the whole
+# intelligent-detection pipeline forever.
+FFMPEG_WINDOW_TIMEOUT_SECONDS = 30.0
 TERMS = [
     # Structural headings and common audiobook front/back matter.  This is a
     # constrained grammar, so every word we might want to pass to the LLM must
@@ -260,8 +264,6 @@ class VoskCandidateService:
         )
         with self._process_lock:
             self._running_processes.append(process)
-        words: List[VoskWord] = []
-
         def collect(payload: str, utterance: int) -> None:
             rows = json.loads(payload).get("result", [])
             if not rows:
@@ -284,22 +286,39 @@ class VoskCandidateService:
                     )
 
         try:
-            if process.stdout is None:
-                raise RuntimeError("ffmpeg did not expose decoded audio")
+            # communicate() drains stdout and stderr together.  Reading only
+            # stdout while leaving stderr for process completion can deadlock
+            # when ffmpeg reports repeated decode errors and fills its stderr
+            # pipe.  The timeout is deliberately per short window, so one bad
+            # media region fails with an actionable location instead of
+            # hanging every later candidate.
+            try:
+                pcm, stderr_bytes = process.communicate(timeout=FFMPEG_WINDOW_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                pcm, stderr_bytes = process.communicate()
+                raise RuntimeError(
+                    "ffmpeg timed out after "
+                    f"{FFMPEG_WINDOW_TIMEOUT_SECONDS:g}s decoding Vosk window "
+                    f"starting at {start:.3f}s"
+                ) from error
+
+            if cancelled.is_set():
+                return []
+            if process.returncode:
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Vosk audio decode failed at {start:.3f}s: {stderr[:500]}"
+                )
+
+            words: List[VoskWord] = []
             utterance = 0
-            while chunk := process.stdout.read(8000):
-                if cancelled.is_set():
-                    process.terminate()
-                    return []
+            for offset in range(0, len(pcm), 8000):
+                chunk = pcm[offset : offset + 8000]
                 if recognizer.AcceptWaveform(chunk):
                     collect(recognizer.Result(), utterance)
                     utterance += 1
-            if cancelled.is_set():
-                return []
             collect(recognizer.FinalResult(), utterance)
-            if process.wait():
-                stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
-                raise RuntimeError(f"Vosk audio decode failed: {stderr[:500]}")
             return words
         finally:
             with self._process_lock:

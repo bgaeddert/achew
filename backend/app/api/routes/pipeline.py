@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.references import ChapterReference, ReferenceValidationResult, TitleReference
 from app.services.processing_pipeline import PipelineProgress, ProcessingPipeline
@@ -93,6 +93,12 @@ class ReferenceValidationResultsResponse(BaseModel):
 
 class ReferenceValidationTranscriptionRequest(BaseModel):
     reference_id: str
+
+
+class IntelligentDetectionManualSelectionRequest(BaseModel):
+    """Candidate indexes retained after manual review of Vosk results."""
+
+    selected_candidate_ids: List[int] = Field(min_length=1)
 
 
 def _require_intelligent_chapter_detection() -> None:
@@ -547,6 +553,34 @@ async def get_reference_validation_results():
     if pipeline.step not in {Step.REFERENCE_VALIDATION_RESULTS, Step.SELECT_WORKFLOW}:
         raise HTTPException(status_code=400, detail="Chapter reference validation results are not ready")
     return ReferenceValidationResultsResponse(references=pipeline._reference_validation_results)
+
+
+@router.post("/pipeline/intelligent-chapter-detection/manual-selection")
+async def apply_manual_intelligent_detection_selection(
+    request: IntelligentDetectionManualSelectionRequest,
+):
+    """Apply manually reviewed intelligent-detection candidates and continue to ASR."""
+    _require_intelligent_chapter_detection()
+    pipeline = get_app_state().pipeline
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.step != Step.REFERENCE_VALIDATION_RESULTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Intelligent detection results are not ready for manual selection",
+        )
+    try:
+        selected_timestamps = await pipeline.apply_intelligent_detection_selection(
+            request.selected_candidate_ids
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "message": "Manual intelligent-detection selection applied; ready for transcription",
+        "selected_candidate_ids": request.selected_candidate_ids,
+        "selected_timestamps": selected_timestamps,
+        "next_step": Step.CONFIGURE_ASR.value,
+    }
 
 
 @router.get(

@@ -2295,6 +2295,41 @@ class ProcessingPipeline:
             f"Ready to transcribe {len(self.cues)} titles from {chapter_ref.name}",
         )
 
+    async def apply_intelligent_detection_selection(self, selected_candidate_ids: List[int]) -> List[float]:
+        """Apply manual decisions to intelligent-detection rows and queue them for ASR."""
+        if self.step != Step.REFERENCE_VALIDATION_RESULTS:
+            raise ValueError("Intelligent detection results are not ready for manual selection")
+        if not selected_candidate_ids:
+            raise ValueError("Select at least one intelligent-detection candidate")
+        if len(selected_candidate_ids) != len(set(selected_candidate_ids)):
+            raise ValueError("Selected intelligent-detection candidate IDs must be unique")
+        if any(candidate_id < 0 for candidate_id in selected_candidate_ids):
+            raise ValueError("Selected intelligent-detection candidate IDs must be nonnegative")
+
+        result = next(
+            (
+                reference
+                for reference in self._reference_validation_results
+                if reference.id == INTELLIGENT_DETECTION_RESULT_ID
+            ),
+            None,
+        )
+        if result is None:
+            raise ValueError("No intelligent-detection result is available for manual selection")
+        candidate_count = len(result.chapters)
+        if any(candidate_id >= candidate_count for candidate_id in selected_candidate_ids):
+            raise ValueError(
+                f"Selected intelligent-detection candidate ID is outside the result (0 through {candidate_count - 1})"
+            )
+
+        selected = set(selected_candidate_ids)
+        for candidate_id, chapter in enumerate(result.chapters):
+            chapter.valid = candidate_id in selected
+
+        self._intelligent_validation_result = result
+        await self.prepare_reference_for_transcription(INTELLIGENT_DETECTION_RESULT_ID)
+        return list(self.cues)
+
     async def _extract_audio_segments(self, preassigned_titles: Optional[Dict[int, str]] = None):
         """Extract audio segments for transcription, skipping cues with preassigned titles"""
 
