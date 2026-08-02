@@ -9,10 +9,19 @@
   import ChapterModal from './ChapterModal.svelte';
   import { session } from '../stores/session';
   import type { ChapterReference } from '../types/references';
-  import type { LLMModel, LLMProvider } from '../types/api';
+  import type { IntelligentDetectionSettings, LLMModel, LLMProvider } from '../types/api';
   import { api } from '../utils/api';
 
+  interface Props {
+    settingsMode?: boolean;
+    onsettingscomplete?: () => void;
+  }
+
+  let { settingsMode = false, onsettingscomplete }: Props = $props();
+
   let loading = $state(false);
+  let starting = $state(false);
+  let savingSettings = $state(false);
   let loadingModels = $state(false);
   let loadingOptions = $state(false);
   let updatingTerms = $state(false);
@@ -26,7 +35,12 @@
   let voskTerms = $state('');
   let minimumPauseSeconds = $state(2);
   let postPauseSeconds = $state(1);
+  let voskClipLength = $state(3);
   let advancedExpanded = $state(false);
+  let quickValidate = $state(true);
+  let llmProcessing = $state(true);
+  let validateReferences = $state(false);
+  let viewResults = $state(false);
   let showReferenceChapters = $state(false);
   let referenceChaptersTitle = $state('');
   let referenceChapters = $state<Array<{ timestamp: number; title: string }>>([]);
@@ -34,11 +48,12 @@
   let configuredProviders = $derived(providers.filter((provider) => provider.is_enabled && provider.is_configured));
   let currentReference = $derived(chapterRefs.find((reference) => reference.id === referenceId));
   let canRun = $derived(
-    Boolean(providerId && modelId && voskTerms.trim() && !loading && !loadingModels && !updatingTerms),
+    Boolean(voskTerms.trim() && (!llmProcessing || (providerId && modelId)) && !loading && !loadingModels && !updatingTerms),
   );
   let canUpdateTerms = $derived(
     Boolean(providerId && modelId && referenceId && !loading && !loadingModels && !updatingTerms),
   );
+  let hasTimedReferences = $derived(chapterRefs.some((reference) => reference.chapters.length > 0));
 
   function parsedTerms() {
     return voskTerms
@@ -91,25 +106,31 @@
   async function loadConfiguration() {
     loadingOptions = true;
     try {
-      const [providerResponse, savedOptions, options] = await Promise.all([
+      const [providerResponse, options] = await Promise.all([
         api.llm.getProviders(),
-        api.batch.getAIOptions(),
         api.session.getIntelligentChapterDetectionOptions(),
       ]);
       providers = providerResponse.providers;
       chapterRefs = options.chapter_refs;
       baseTerms = options.base_terms;
-      resetTerms();
+      voskTerms = (options.vosk_terms.length > 0 ? options.vosk_terms : baseTerms).join(' ');
+      minimumPauseSeconds = options.minimum_pause_seconds;
+      postPauseSeconds = options.post_pause_seconds;
+      voskClipLength = options.vosk_clip_length;
+      quickValidate = options.quick_validate;
+      llmProcessing = options.llm_processing;
+      validateReferences = false;
+      viewResults = false;
       referenceId = chapterRefs[0]?.id ?? '';
 
       const availableProviders = providerResponse.providers.filter(
         (provider) => provider.is_enabled && provider.is_configured,
       );
       providerId =
-        availableProviders.find((provider) => provider.id === savedOptions.provider_id)?.id ??
+        availableProviders.find((provider) => provider.id === options.provider_id)?.id ??
         availableProviders[0]?.id ??
         '';
-      modelId = savedOptions.model_id;
+      modelId = options.model_id;
       await loadModels(providerId);
     } catch (error) {
       console.error('Failed to load intelligent detection configuration:', error);
@@ -121,11 +142,23 @@
 
   async function saveSelection() {
     try {
-      const options = await api.batch.getAIOptions();
-      await api.batch.updateAIOptions({ ...options, provider_id: providerId, model_id: modelId });
+      await api.config.updateIntelligentDetectionSettings(currentSettings());
     } catch (error) {
-      console.warn('Failed to save LLM selection:', error);
+      console.warn('Failed to save intelligent detection settings:', error);
     }
+  }
+
+  function currentSettings(): IntelligentDetectionSettings {
+    return {
+      provider_id: providerId,
+      model_id: modelId,
+      vosk_terms: parsedTerms(),
+      minimum_pause_seconds: minimumPauseSeconds,
+      post_pause_seconds: postPauseSeconds,
+      vosk_clip_length: voskClipLength,
+      quick_validate: quickValidate,
+      llm_processing: llmProcessing,
+    };
   }
 
   async function handleProviderChange(event: Event) {
@@ -148,7 +181,7 @@
       const response = await api.session.updateIntelligentSearchTerms(providerId, modelId, referenceId, parsedTerms());
       voskTerms = response.terms.join(' ');
     } catch (error) {
-      console.error('Failed to update Vosk search terms:', error);
+      console.error('Failed to update search terms:', error);
       session.setError('Failed to update search terms: ' + (error as Error).message);
     } finally {
       updatingTerms = false;
@@ -158,17 +191,37 @@
   async function run() {
     if (!canRun) return;
     loading = true;
+    starting = true;
     try {
       await saveSelection();
       await api.session.intelligentChapterDetection('run', providerId, modelId, {
         voskTerms: parsedTerms(),
         minimumPauseSeconds,
         postPauseSeconds,
+        voskClipLength,
+        llmTriage: llmProcessing,
+        viewResults,
+        validateReferences,
       });
     } catch (error) {
       console.error('Failed to run intelligent chapter detection:', error);
       session.setError('Failed to start intelligent detection: ' + (error as Error).message);
       loading = false;
+      starting = false;
+    }
+  }
+
+  function handleViewResultsChange(event: Event) {
+    viewResults = (event.target as HTMLInputElement).checked;
+    if (!viewResults) {
+      validateReferences = false;
+    }
+  }
+
+  function handleValidateReferencesChange(event: Event) {
+    validateReferences = (event.target as HTMLInputElement).checked;
+    if (validateReferences) {
+      viewResults = true;
     }
   }
 
@@ -184,20 +237,62 @@
     }
   }
 
+  async function saveSettings() {
+    if (savingSettings || loadingOptions) return;
+    savingSettings = true;
+    try {
+      await api.config.updateIntelligentDetectionSettings(currentSettings());
+      const response = await fetch('/api/complete-intelligent-detection-setup', { method: 'POST' });
+      if (!response.ok) {
+        throw new Error('Failed to close intelligent detection settings');
+      }
+      await session.loadActiveSession();
+      onsettingscomplete?.();
+    } catch (error) {
+      console.error('Failed to save intelligent detection settings:', error);
+      session.setError('Failed to save intelligent detection settings: ' + (error as Error).message);
+    } finally {
+      savingSettings = false;
+    }
+  }
+
+  async function cancelSettings() {
+    if (savingSettings) return;
+    savingSettings = true;
+    try {
+      const response = await fetch('/api/complete-intelligent-detection-setup', { method: 'POST' });
+      if (!response.ok) {
+        throw new Error('Failed to close intelligent detection settings');
+      }
+      await session.loadActiveSession();
+      onsettingscomplete?.();
+    } catch (error) {
+      console.error('Failed to close intelligent detection settings:', error);
+      session.setError('Failed to close intelligent detection settings: ' + (error as Error).message);
+    } finally {
+      savingSettings = false;
+    }
+  }
+
   onMount(loadConfiguration);
 </script>
 
 <div class="intelligent-detection">
   <div class="header">
-    <h2>Intelligent Chapter Detection</h2>
-    <p>
-      Check the strongest pauses for spoken headings, then use the selected LLM to choose the most likely chapter
-      boundaries. Especially useful for stubborn audiobooks with too many possible pauses.
-    </p>
+    {#if settingsMode}
+      <h2>Intelligent Detection Settings</h2>
+      <p>Configure the defaults used to find spoken chapter headings.</p>
+    {:else}
+      <h2>Intelligent Chapter Detection</h2>
+      <p>
+        Check the strongest pauses for spoken headings, then use the selected LLM to choose the most likely chapter
+        boundaries. Especially useful for stubborn audiobooks with too many possible pauses.
+      </p>
+    {/if}
   </div>
 
   <section class="configuration">
-    {#if configuredProviders.length === 0 && !loadingOptions}
+    {#if llmProcessing && configuredProviders.length === 0 && !loadingOptions}
       <div class="notice">
         <TriangleAlert size="20" />
         <div>
@@ -206,7 +301,21 @@
         </div>
       </div>
     {:else}
-      <div class="form-row">
+      {#if !settingsMode && !llmProcessing}
+        <div class="notice">
+          <TriangleAlert size="20" />
+          <div>
+            <strong>LLM Triage is disabled.</strong>
+            <span>
+              Detected cues will continue without LLM review. Enable LLM Triage in Intelligent Detection Settings
+              to filter candidate boundaries with a provider and model.
+            </span>
+          </div>
+        </div>
+      {/if}
+
+      {#if settingsMode || llmProcessing}
+        <div class="form-row">
         <label>
           <span>Provider</span>
           <div class="select-wrap">
@@ -239,9 +348,11 @@
             <ChevronDown size={18} strokeWidth={2.25} />
           </div>
         </label>
-      </div>
+        </div>
+      {/if}
 
-      <div class="reference-row">
+      {#if !settingsMode && llmProcessing}
+        <div class="reference-row">
         <label for="heading-reference">Reference</label>
         <div class="reference-controls">
           <div class="select-wrap reference-select-wrap">
@@ -277,11 +388,12 @@
         {#if currentReference}
           <p>Optional: Use this reference to suggest additional spoken heading words. No audio is sent to the LLM.</p>
         {/if}
-      </div>
+        </div>
+      {/if}
 
       <div class="terms-input-container">
         <div class="terms-heading">
-          <label for="vosk-terms">Vosk Search Terms</label>
+          <label for="vosk-terms">Search Terms</label>
         </div>
         <div class="input-with-reset">
           <textarea
@@ -289,15 +401,15 @@
             bind:value={voskTerms}
             disabled={loading || updatingTerms}
             class="terms-input"
-            placeholder="Enter Vosk search terms…"
+            placeholder="Enter search terms…"
             rows="3"
           ></textarea>
           <button
             type="button"
             class="reset-button"
             onclick={resetTerms}
-            aria-label="Reset to default Vosk terms"
-            title="Reset to default Vosk terms"
+            aria-label="Reset to default search terms"
+            title="Reset to default search terms"
             disabled={loading || updatingTerms}
           >
             <RotateCcw size="12" />
@@ -317,7 +429,7 @@
                 <label for="minimum-pause">Minimum Pause</label>
                 <span
                   class="help-icon"
-                  use:tooltip={{ text: 'Only pauses at or above this duration are checked with Vosk.', delay: 0 }}
+                  use:tooltip={{ text: 'Only pauses at or above this duration are checked for spoken headings.', delay: 0 }}
                 >
                   <CircleQuestionMark size="14" />
                 </span>
@@ -363,17 +475,150 @@
                 <div class="slider-value">{postPauseSeconds}s</div>
               </div>
             </div>
+            <div class="setting-item">
+              <div class="setting-header">
+                <label for="vosk-clip-length">Clip Length</label>
+                <span
+                  class="help-icon"
+                  use:tooltip={{
+                    text: 'The audio length checked after each timecode. The 0.5-second pre-roll is unchanged; overlapping clips are processed together.',
+                    delay: 0,
+                  }}
+                >
+                  <CircleQuestionMark size="14" />
+                </span>
+              </div>
+              <div class="slider-container">
+                <input
+                  id="vosk-clip-length"
+                  type="range"
+                  min="3"
+                  max="8"
+                  step="1"
+                  bind:value={voskClipLength}
+                  class="slider"
+                  disabled={loading || updatingTerms || savingSettings}
+                />
+                <div class="slider-value">{voskClipLength}s</div>
+              </div>
+            </div>
           </div>
         {/if}
       </div>
     {/if}
   </section>
 
+  <div class="run-options">
+    {#if settingsMode}
+      <label class="checkbox-label">
+        <input
+          type="checkbox"
+          bind:checked={quickValidate}
+          disabled={savingSettings || loadingOptions}
+          class="option-checkbox"
+        />
+        <span class="checkbox-text">
+          Pre-scan References
+          <span
+            class="help-icon"
+            use:tooltip={{
+              text: 'Enable the post-download reference pre-scan. This does not affect Intelligent Detection runs.',
+              delay: 0,
+            }}
+          >
+            <CircleQuestionMark size="14" />
+          </span>
+        </span>
+      </label>
+      <label class="checkbox-label">
+        <input
+          type="checkbox"
+          bind:checked={llmProcessing}
+          disabled={savingSettings || loadingOptions}
+          class="option-checkbox"
+        />
+        <span class="checkbox-text">
+          LLM Triage
+          <span
+            class="help-icon"
+            use:tooltip={{
+              text: 'When disabled, Intelligent Detection keeps detected cues without sending them to an LLM for triage.',
+              delay: 0,
+            }}
+          >
+            <CircleQuestionMark size="14" />
+          </span>
+        </span>
+      </label>
+    {:else}
+      <label class="checkbox-label">
+        <input
+          type="checkbox"
+          checked={viewResults}
+          onchange={handleViewResultsChange}
+          disabled={loading || updatingTerms}
+          class="option-checkbox"
+        />
+        <span class="checkbox-text">
+          View Results
+          <span
+            class="help-icon"
+            use:tooltip={{
+              text: 'Show the accepted Intelligent Detection headings before continuing instead of going directly to transcription settings.',
+              delay: 0,
+            }}
+          >
+            <CircleQuestionMark size="14" />
+          </span>
+        </span>
+      </label>
+
+      <label
+        class="checkbox-label"
+        use:tooltip={{
+          text: !hasTimedReferences ? 'No timed Chapter References are available to validate' : null,
+          delay: 0,
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={validateReferences}
+          onchange={handleValidateReferencesChange}
+          disabled={loading || updatingTerms || !hasTimedReferences}
+          class="option-checkbox"
+        />
+        <span class="checkbox-text">
+          Validate References
+          <span
+            class="help-icon"
+            use:tooltip={{
+            text: hasTimedReferences
+              ? llmProcessing
+                ? 'Also check every timed Chapter Reference for spoken headings and review them with the selected LLM, then compare them with Intelligent Detection. This automatically enables View Results.'
+                : 'Also check every timed Chapter Reference for spoken headings, then compare them with Intelligent Detection. This automatically enables View Results.'
+              : 'No timed Chapter References are available to validate.',
+              delay: 0,
+            }}
+          >
+            <CircleQuestionMark size="14" />
+          </span>
+        </span>
+      </label>
+    {/if}
+  </div>
+
   <div class="actions">
-    <button class="btn btn-cancel" onclick={cancel} disabled={loading || updatingTerms}>Cancel</button>
-    <button class="btn btn-verify" onclick={run} disabled={!canRun}>
-      {loading ? 'Starting…' : 'Detect Chapters'}
-    </button>
+    {#if settingsMode}
+      <button class="btn btn-cancel" onclick={cancelSettings} disabled={savingSettings}>Cancel</button>
+      <button class="btn btn-verify" onclick={saveSettings} disabled={savingSettings || loadingOptions}>
+        {savingSettings ? 'Saving…' : 'Save'}
+      </button>
+    {:else}
+      <button class="btn btn-cancel" onclick={cancel} disabled={loading || updatingTerms}>Cancel</button>
+      <button class="btn btn-verify" onclick={run} disabled={!canRun}>
+        {starting ? 'Starting…' : 'Detect Chapters'}
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -624,9 +869,55 @@
     color: var(--text-primary);
   }
   .help-icon {
-    display: inline-flex;
+    border: none;
+    background: transparent;
     color: var(--text-secondary);
+    padding: 2px;
+    border-radius: 50%;
+    transition: all 0.2s ease;
+    position: relative;
     cursor: help;
+    display: inline-flex;
+  }
+  .help-icon:hover {
+    color: var(--primary-color);
+    background: var(--bg-tertiary);
+  }
+  .run-options {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2rem;
+    margin-top: 1.25rem;
+  }
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  .option-checkbox {
+    margin: 0;
+    cursor: pointer;
+  }
+  .checkbox-text {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 500;
+  }
+  .checkbox-label:hover .checkbox-text {
+    color: var(--primary-color);
+  }
+  .checkbox-label:has(.option-checkbox:disabled) {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .option-checkbox:disabled {
+    cursor: not-allowed;
   }
   .slider-container {
     display: grid;
@@ -668,6 +959,11 @@
     }
     .actions button {
       width: 100%;
+    }
+    .run-options {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 0.75rem;
     }
   }
 </style>

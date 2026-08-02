@@ -31,6 +31,8 @@ from ..models.references import (
     BasicChapter,
     ChapterReference,
     ChapterRefType,
+    ReferenceValidationChapter,
+    ReferenceValidationResult,
     TitleReference,
     TitleRefType,
 )
@@ -45,7 +47,7 @@ from .vosk_candidate_service import (
     TERMS,
     CandidateEvidence,
     VoskCandidateService,
-    VoskWord,
+    group_vosk_utterances,
     is_vosk_available,
     normalize_vosk_terms,
 )
@@ -62,6 +64,7 @@ def _silent_progress(step: Step, percent: float, message: str = "", details: Opt
 DRAMATIZED_PROBE_MESSAGE = "Detecting dramatized audio…"
 MIN_INTELLIGENT_SILENCE_SECONDS = 2.0
 INTELLIGENT_TRIAGE_TIMEOUT_SECONDS = 120.0
+INTELLIGENT_DETECTION_RESULT_ID = "intelligent-chapter-detection"
 
 
 class ProcessingError(Exception):
@@ -145,9 +148,13 @@ class ProcessingPipeline:
         # user retries an LLM decision so a provider error never re-scans audio.
         self._intelligent_candidates: List[DetectedCue] = []
         self._intelligent_vosk_evidence: Optional[List[CandidateEvidence]] = None
-        self._intelligent_vosk_config: Optional[Tuple[Tuple[str, ...], float]] = None
+        self._intelligent_vosk_config: Optional[Tuple[Tuple[str, ...], float, float]] = None
         self._intelligent_reference_terms: List[str] = []
         self._intelligent_llm_debug: Optional[Dict[str, Any]] = None
+        self._reference_validation_results: List[ReferenceValidationResult] = []
+        self._reference_vosk_results: List[ReferenceValidationResult] = []
+        self._reference_validation_origin: Optional[Step] = None
+        self._intelligent_validation_result: Optional[ReferenceValidationResult] = None
 
         # Scan coverage tracking
         self.normal_scanned_regions: List[Tuple[float, float]] = []
@@ -411,6 +418,9 @@ class ProcessingPipeline:
             self._intelligent_vosk_evidence = None
             self._intelligent_vosk_config = None
             self._intelligent_reference_terms = []
+            self._reference_validation_results = []
+            self._reference_validation_origin = None
+            self._intelligent_validation_result = None
             self.normal_scanned_regions = []
             self.vad_scanned_regions = []
             self.initial_chapter_selection_available = False
@@ -928,6 +938,33 @@ class ProcessingPipeline:
                         None, probe_segment_extension, self.audio_file_path, self.temp_dir
                     )
 
+                intelligent_detection_settings = get_app_config().intelligent_detection
+                if (
+                    intelligent_detection_settings.quick_validate
+                    and is_vosk_available()
+                    and any(reference.chapters for reference in self.chapter_refs)
+                ):
+                    self._notify_progress(
+                        Step.REFERENCE_VALIDATION,
+                        0,
+                        "Scanning Chapter References with Vosk…",
+                    )
+                    try:
+                        await self.validate_chapter_references(
+                            "",
+                            "",
+                            list(TERMS),
+                            vosk_clip_length=intelligent_detection_settings.vosk_clip_length,
+                            origin_step=Step.SELECT_WORKFLOW,
+                            use_llm=False,
+                            store_as_vosk_baseline=True,
+                        )
+                    except Exception as e:
+                        # Reference scoring is advisory and must not prevent the
+                        # user from continuing with the established workflows.
+                        self._reference_vosk_results = []
+                        logger.warning("Automatic Vosk reference scan failed: %s", e, exc_info=True)
+
                 self.step = Step.SELECT_WORKFLOW
 
             return {
@@ -995,6 +1032,42 @@ class ProcessingPipeline:
 
     async def _quick_edit(self, ref_id: str):
         """Skip all processing and load chapters directly into the editor"""
+        if ref_id == INTELLIGENT_DETECTION_RESULT_ID:
+            result = next(
+                (
+                    result
+                    for result in self._reference_validation_results
+                    if result.id == INTELLIGENT_DETECTION_RESULT_ID
+                ),
+                None,
+            )
+            if result is None:
+                raise ValueError("Intelligent Chapter Detection results are not available for quick edit")
+
+            headings_by_timestamp = {
+                chapter.timestamp: chapter.headings.strip()
+                for chapter in result.chapters
+                if chapter.valid and 0 <= chapter.timestamp < self.book_duration
+            }
+            headings_by_timestamp.setdefault(0.0, "")
+
+            self.is_quick_edit = True
+            self.chapters = [
+                ChapterData(
+                    timestamp=timestamp,
+                    transcript=headings,
+                    title=headings,
+                )
+                for timestamp, headings in sorted(headings_by_timestamp.items())
+            ]
+
+            logger.info(
+                "Quick edit: loaded %d chapters from Intelligent Chapter Detection",
+                len(self.chapters),
+            )
+            self._notify_progress(Step.CHAPTER_EDITING, 0)
+            return
+
         chapter_ref = next((src for src in self.chapter_refs if src.id == ref_id), None)
 
         if not chapter_ref:
@@ -1632,11 +1705,14 @@ class ProcessingPipeline:
         vosk_terms: Optional[List[str]] = None,
         minimum_pause_seconds: float = MIN_INTELLIGENT_SILENCE_SECONDS,
         post_pause_seconds: float = 1.0,
+        vosk_clip_length: float = 3.0,
+        use_llm: bool = True,
+        comparison_mode: bool = False,
     ):
         """Use local Vosk evidence and the selected LLM to conservatively reduce silence candidates."""
         if self.step != Step.INTELLIGENT_CHAPTER_DETECTION:
             raise ProcessingError("Intelligent chapter detection is not ready to run")
-        if not provider_id or not model_id:
+        if use_llm and (not provider_id or not model_id):
             raise ProcessingError("Choose an LLM provider and model before running intelligent detection")
 
         terms = normalize_vosk_terms(vosk_terms if vosk_terms is not None else TERMS)
@@ -1644,7 +1720,8 @@ class ProcessingPipeline:
             raise ProcessingError("Enter at least one Vosk search term")
         minimum_pause_seconds = max(2.0, min(6.0, float(minimum_pause_seconds)))
         post_pause_seconds = max(0.5, min(2.0, float(post_pause_seconds)))
-        vosk_config = (tuple(terms), minimum_pause_seconds)
+        vosk_clip_length = max(3.0, min(8.0, float(vosk_clip_length)))
+        vosk_config = (tuple(terms), minimum_pause_seconds, vosk_clip_length)
         reference_terms = [term for term in self._intelligent_reference_terms if term in terms]
 
         async def run() -> None:
@@ -1669,6 +1746,7 @@ class ProcessingPipeline:
                         running_processes=self._running_processes,
                         process_lock=self._process_lock,
                         terms=terms,
+                        after_seconds=vosk_clip_length,
                     )
                     anchors = [cue.timestamp + CHAPTER_START_PADDING for cue in candidates]
                     evidence = await service.collect(self.audio_file_path, self.book_duration, anchors)
@@ -1694,10 +1772,7 @@ class ProcessingPipeline:
                     if not row.words:
                         continue
 
-                    utterances_by_id: Dict[int, List[VoskWord]] = {}
-                    for word in row.words:
-                        utterances_by_id.setdefault(word.utterance, []).append(word)
-                    utterances = list(utterances_by_id.values())
+                    utterances = group_vosk_utterances(row.words)
                     anchor = cue.timestamp + CHAPTER_START_PADDING
                     primary_index = min(
                         range(len(utterances)),
@@ -1750,62 +1825,69 @@ class ProcessingPipeline:
                         "Vosk did not recognize structural words near any eligible silence; skip to review raw silences"
                     )
 
-                def triage_progress(
-                    _step: Step, percent: float, message: str = "", details: Optional[Dict[str, Any]] = None
-                ):
-                    self._notify_progress(Step.LLM_CANDIDATE_TRIAGE, percent, message, details)
+                if use_llm:
+                    def triage_progress(
+                        _step: Step, percent: float, message: str = "", details: Optional[Dict[str, Any]] = None
+                    ):
+                        self._notify_progress(Step.LLM_CANDIDATE_TRIAGE, percent, message, details)
 
-                from ..services.llm_providers.registry import create_provider
+                    from ..services.llm_providers.registry import create_provider
 
-                provider = create_provider(provider_id, triage_progress)
-                if provider is None:
-                    raise ProcessingError(f"Unknown LLM provider: {provider_id}")
-                # LLM response time is not measurable.  Use the existing
-                # indeterminate progress treatment instead of displaying a
-                # misleading 0% bar while the request is in flight.
-                self._notify_progress(
-                    Step.LLM_CANDIDATE_TRIAGE,
-                    -1,
-                    "Vosk analysis complete; waiting for the selected LLM to review candidate boundaries…",
-                )
-                debug_metadata = {
-                    "provider_id": provider_id,
-                    "model_id": model_id,
-                    "candidate_count": len(triage_rows),
-                    "post_pause_seconds": post_pause_seconds,
-                }
-                try:
-                    decisions = await asyncio.wait_for(
-                        provider.triage_chapter_candidates(
-                            triage_rows,
-                            model_id=model_id,
-                            book=self.book,
-                            reference_terms=reference_terms,
-                        ),
-                        timeout=INTELLIGENT_TRIAGE_TIMEOUT_SECONDS,
+                    provider = create_provider(provider_id, triage_progress)
+                    if provider is None:
+                        raise ProcessingError(f"Unknown LLM provider: {provider_id}")
+                    # LLM response time is not measurable.  Use the existing
+                    # indeterminate progress treatment instead of displaying a
+                    # misleading 0% bar while the request is in flight.
+                    self._notify_progress(
+                        Step.LLM_CANDIDATE_TRIAGE,
+                        -1,
+                        "Vosk analysis complete; waiting for the selected LLM to review candidate boundaries…",
                     )
-                except asyncio.TimeoutError as e:
-                    self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
-                    raise ProcessingError(
-                        "LLM candidate review timed out after 2 minutes. "
-                        "Vosk results were kept; retry with a faster model."
-                    ) from e
-                except Exception as e:
-                    self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
-                    raise
-                self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug)
-                decisions_by_id = {decision.candidate_id: decision for decision in decisions}
-                expected_ids = {row["candidate_id"] for row in triage_rows}
-                if len(decisions_by_id) != len(decisions) or set(decisions_by_id) != expected_ids:
-                    raise ProcessingError("The LLM returned an incomplete or invalid set of candidate decisions")
+                    debug_metadata = {
+                        "provider_id": provider_id,
+                        "model_id": model_id,
+                        "candidate_count": len(triage_rows),
+                        "post_pause_seconds": post_pause_seconds,
+                    }
+                    try:
+                        decisions = await asyncio.wait_for(
+                            provider.triage_chapter_candidates(
+                                triage_rows,
+                                model_id=model_id,
+                                book=self.book,
+                                reference_terms=reference_terms,
+                            ),
+                            timeout=INTELLIGENT_TRIAGE_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError as e:
+                        self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
+                        raise ProcessingError(
+                            "LLM candidate review timed out after 2 minutes. "
+                            "Vosk results were kept; retry with a faster model."
+                        ) from e
+                    except Exception as e:
+                        self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug, e)
+                        raise
+                    self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug)
+                    decisions_by_id = {decision.candidate_id: decision for decision in decisions}
+                    expected_ids = {row["candidate_id"] for row in triage_rows}
+                    if len(decisions_by_id) != len(decisions) or set(decisions_by_id) != expected_ids:
+                        raise ProcessingError("The LLM returned an incomplete or invalid set of candidate decisions")
 
-                retained = [
-                    triage_cues[row["candidate_id"]] for row in triage_rows if decisions_by_id[row["candidate_id"]].keep
-                ]
-                if not retained:
-                    raise ProcessingError(
-                        "The LLM did not retain any chapter candidates; skip instead to review raw silences"
-                    )
+                    retained = [
+                        triage_cues[row["candidate_id"]]
+                        for row in triage_rows
+                        if decisions_by_id[row["candidate_id"]].keep
+                    ]
+                    if not retained:
+                        raise ProcessingError(
+                            "The LLM did not retain any chapter candidates; skip instead to review raw silences"
+                        )
+                    retained_ids = {row["candidate_id"] for row in triage_rows if decisions_by_id[row["candidate_id"]].keep}
+                else:
+                    retained = [triage_cues[row["candidate_id"]] for row in triage_rows]
+                    retained_ids = {row["candidate_id"] for row in triage_rows}
 
                 # ``detected_cues`` remains the complete silence scan so the
                 # editor's Add Chapter From dialog can still offer every
@@ -1815,21 +1897,403 @@ class ProcessingPipeline:
                 # manual selection.  SIC always adds the book start, so the
                 # automatic path does too.
                 self.cues = self._filter_cues_by_duration(sorted({0.0, *(cue.timestamp for cue in retained)}))
+                if comparison_mode:
+                    description = (
+                        "Chapter boundaries generated from the audiobook's silence candidates using Vosk and "
+                        "the selected LLM."
+                        if use_llm
+                        else "Chapter boundaries generated from Vosk-recognized structural terms without LLM review."
+                    )
+                    self._intelligent_validation_result = ReferenceValidationResult(
+                        id=INTELLIGENT_DETECTION_RESULT_ID,
+                        name="Intelligent Chapter Detection",
+                        short_name="Intelligent Detection",
+                        description=description,
+                        metadata={},
+                        type="intelligent_detection",
+                        chapters=[
+                            ReferenceValidationChapter(
+                                timestamp=triage_cues[row["candidate_id"]].timestamp,
+                                title=f"Candidate {index}",
+                                headings=row["spoken_terms"],
+                                valid=row["candidate_id"] in retained_ids,
+                            )
+                            for index, row in enumerate(triage_rows, 1)
+                        ],
+                        duration=self.book_duration,
+                    )
+                    return
+
                 self._notify_progress(
                     Step.CONFIGURE_ASR,
                     0,
                     f"Auto-selected {len(self.cues)} chapter boundaries; ready for transcription configuration",
                 )
                 logger.info(
-                    "Intelligent detection selected %d chapter boundaries from %d original silence candidates",
+                    "Intelligent detection selected %d chapter boundaries from %d original silence candidates%s",
                     len(self.cues),
                     len(self.detected_cues),
+                    " without LLM review" if not use_llm else "",
                 )
             finally:
                 self._intelligent_detection_task = None
 
         self._intelligent_detection_task = asyncio.create_task(run())
         await self._intelligent_detection_task
+
+    async def validate_chapter_references(
+        self,
+        provider_id: str,
+        model_id: str,
+        vosk_terms: Optional[List[str]] = None,
+        vosk_clip_length: float = 3.0,
+        origin_step: Optional[Step] = None,
+        initial_results: Optional[List[ReferenceValidationResult]] = None,
+        use_llm: bool = True,
+        store_as_vosk_baseline: bool = False,
+    ):
+        """Check the spoken heading at every timestamp in each chapter reference."""
+        validation_origin = origin_step or self.step
+        if validation_origin not in {Step.INTELLIGENT_CHAPTER_DETECTION, Step.SELECT_WORKFLOW}:
+            raise ProcessingError("Chapter references are not ready to validate")
+        if use_llm and (not provider_id or not model_id):
+            raise ProcessingError("Choose an LLM provider and model before validating references")
+
+        terms = normalize_vosk_terms(vosk_terms if vosk_terms is not None else TERMS)
+        vosk_clip_length = max(3.0, min(8.0, float(vosk_clip_length)))
+        if not terms:
+            raise ProcessingError("Enter at least one Vosk search term")
+        references = [reference for reference in self.chapter_refs if reference.chapters]
+        if not references:
+            raise ProcessingError("No timed chapter references are available to validate")
+        reference_terms = [term for term in self._intelligent_reference_terms if term in terms]
+        self._reference_validation_origin = validation_origin
+
+        async def run() -> None:
+            try:
+                validation_results = list(initial_results or [])
+                if store_as_vosk_baseline:
+                    self._reference_vosk_results = validation_results
+                else:
+                    self._reference_validation_results = validation_results
+                reference_count = len(references)
+                for reference_index, reference in enumerate(references, 1):
+                    action = "Validating" if use_llm else "Scanning"
+                    prefix = f"{action} {reference.name} ({reference_index} of {reference_count})"
+                    base_percent = (reference_index - 1) / reference_count * 100
+                    reference_span = 100 / reference_count
+                    vosk_fraction = 0.8 if use_llm else 1.0
+                    indexed_chapters = [
+                        (chapter_index, chapter)
+                        for chapter_index, chapter in enumerate(reference.chapters)
+                        if 0 <= chapter.timestamp < self.book_duration
+                    ]
+                    validation_chapters = [
+                        ReferenceValidationChapter(
+                            timestamp=chapter.timestamp,
+                            title=chapter.title,
+                        )
+                        for chapter in reference.chapters
+                    ]
+
+                    if indexed_chapters:
+
+                        def vosk_progress(
+                            step: Step,
+                            percent: float,
+                            message: str = "",
+                            details: Optional[Dict[str, Any]] = None,
+                        ):
+                            local_percent = max(0.0, min(100.0, percent))
+                            self._notify_progress(
+                                Step.REFERENCE_VALIDATION,
+                                base_percent + reference_span * vosk_fraction * local_percent / 100,
+                                f"{reference.name} ({reference_index} of {reference_count})",
+                                {
+                                    **(details or {}),
+                                    "reference_name": reference.name,
+                                    "reference_index": reference_index,
+                                    "reference_count": reference_count,
+                                    "phase": "vosk",
+                                },
+                            )
+
+                        service = VoskCandidateService(
+                            progress_callback=vosk_progress,
+                            running_processes=self._running_processes,
+                            process_lock=self._process_lock,
+                            terms=terms,
+                            after_seconds=vosk_clip_length,
+                        )
+                        evidence = await service.collect(
+                            self.audio_file_path,
+                            self.book_duration,
+                            [chapter.timestamp for _, chapter in indexed_chapters],
+                        )
+                    else:
+                        evidence = []
+
+                    triage_rows = []
+                    chapter_by_candidate_id: Dict[str, ReferenceValidationChapter] = {}
+                    for (chapter_index, chapter), candidate_evidence in zip(indexed_chapters, evidence):
+                        utterances = group_vosk_utterances(candidate_evidence.words)
+                        if not utterances:
+                            continue
+                        primary_words = min(
+                            utterances,
+                            key=lambda utterance: min(abs(word.start - chapter.timestamp) for word in utterance),
+                        )
+                        heading = " ".join(word.word for word in primary_words)
+                        if not heading:
+                            continue
+
+                        validation_chapter = validation_chapters[chapter_index]
+                        validation_chapter.headings = heading
+                        validation_chapter.valid = not use_llm
+                        candidate_id = f"reference-{reference_index}-chapter-{chapter_index + 1}"
+                        chapter_by_candidate_id[candidate_id] = validation_chapter
+                        triage_rows.append(
+                            {
+                                "candidate_id": candidate_id,
+                                "timestamp_seconds": round(chapter.timestamp, 3),
+                                "silence_seconds": 0.0,
+                                "first_word_offset_seconds": round(primary_words[0].start - chapter.timestamp, 3),
+                                "spoken_terms": heading,
+                            }
+                        )
+
+                    if triage_rows and use_llm:
+
+                        def triage_progress(
+                            _step: Step,
+                            percent: float,
+                            message: str = "",
+                            details: Optional[Dict[str, Any]] = None,
+                        ):
+                            mapped_percent = (
+                                -1
+                                if percent < 0
+                                else base_percent + reference_span * (0.8 + 0.2 * min(100.0, percent) / 100)
+                            )
+                            self._notify_progress(
+                                Step.REFERENCE_VALIDATION,
+                                mapped_percent,
+                                f"{prefix}: waiting for LLM review…",
+                                {
+                                    **(details or {}),
+                                    "reference_name": reference.name,
+                                    "reference_index": reference_index,
+                                    "reference_count": reference_count,
+                                    "phase": "llm",
+                                },
+                            )
+
+                        from ..services.llm_providers.registry import create_provider
+
+                        provider = create_provider(provider_id, triage_progress)
+                        if provider is None:
+                            raise ProcessingError(f"Unknown LLM provider: {provider_id}")
+                        self._notify_progress(
+                            Step.REFERENCE_VALIDATION,
+                            -1,
+                            f"{prefix}: waiting for LLM review…",
+                            {
+                                "reference_name": reference.name,
+                                "reference_index": reference_index,
+                                "reference_count": reference_count,
+                                "phase": "llm",
+                            },
+                        )
+                        debug_metadata = {
+                            "provider_id": provider_id,
+                            "model_id": model_id,
+                            "reference_id": reference.id,
+                            "reference_name": reference.name,
+                            "candidate_count": len(triage_rows),
+                            "purpose": "reference_validation",
+                        }
+                        try:
+                            decisions = await asyncio.wait_for(
+                                provider.triage_chapter_candidates(
+                                    triage_rows,
+                                    model_id=model_id,
+                                    book=self.book,
+                                    reference_terms=reference_terms,
+                                ),
+                                timeout=INTELLIGENT_TRIAGE_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError as e:
+                            self._capture_intelligent_llm_debug(
+                                debug_metadata,
+                                provider.last_intelligent_debug,
+                                e,
+                            )
+                            raise ProcessingError(f"LLM review of {reference.name} timed out after 2 minutes") from e
+                        except Exception as e:
+                            self._capture_intelligent_llm_debug(
+                                debug_metadata,
+                                provider.last_intelligent_debug,
+                                e,
+                            )
+                            raise
+                        self._capture_intelligent_llm_debug(debug_metadata, provider.last_intelligent_debug)
+
+                        decisions_by_id = {decision.candidate_id: decision for decision in decisions}
+                        expected_ids = set(chapter_by_candidate_id)
+                        if len(decisions_by_id) != len(decisions) or set(decisions_by_id) != expected_ids:
+                            raise ProcessingError(
+                                f"The LLM returned incomplete or invalid decisions for {reference.name}"
+                            )
+                        for candidate_id, validation_chapter in chapter_by_candidate_id.items():
+                            validation_chapter.valid = decisions_by_id[candidate_id].keep
+
+                    validation_results.append(
+                        ReferenceValidationResult(
+                            id=reference.id,
+                            name=reference.name,
+                            short_name=reference.short_name,
+                            description=reference.description,
+                            metadata=reference.metadata,
+                            type=reference.type,
+                            chapters=validation_chapters,
+                            duration=reference.duration,
+                        )
+                    )
+                    self._notify_progress(
+                        Step.REFERENCE_VALIDATION,
+                        reference_index / reference_count * 100,
+                        (
+                            f"Validated {reference.name} ({reference_index} of {reference_count})"
+                            if use_llm
+                            else f"Scanned {reference.name} ({reference_index} of {reference_count})"
+                        ),
+                        {
+                            "reference_name": reference.name,
+                            "reference_index": reference_index,
+                            "reference_count": reference_count,
+                            "phase": "complete",
+                        },
+                    )
+
+                result_step = (
+                    Step.SELECT_WORKFLOW
+                    if validation_origin == Step.SELECT_WORKFLOW
+                    else Step.REFERENCE_VALIDATION_RESULTS
+                )
+                self._notify_progress(
+                    result_step,
+                    100,
+                    (
+                        f"Compared Intelligent Chapter Detection with {reference_count} chapter references"
+                        if initial_results
+                        else (
+                            f"Validated {reference_count} chapter references"
+                            if use_llm
+                            else f"Scanned {reference_count} chapter references with Vosk"
+                        )
+                    ),
+                )
+            finally:
+                self._intelligent_detection_task = None
+
+        self._intelligent_detection_task = asyncio.create_task(run())
+        await self._intelligent_detection_task
+
+    async def run_intelligent_detection_for_results(
+        self,
+        provider_id: str,
+        model_id: str,
+        vosk_terms: Optional[List[str]] = None,
+        minimum_pause_seconds: float = MIN_INTELLIGENT_SILENCE_SECONDS,
+        post_pause_seconds: float = 1.0,
+        vosk_clip_length: float = 3.0,
+        use_llm: bool = True,
+        validate_references: bool = False,
+    ) -> None:
+        """Run intelligent detection and optionally compare it with timed references."""
+        if self.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+            raise ProcessingError("Intelligent chapter detection is not ready to show results")
+
+        self._intelligent_validation_result = None
+        await self.run_intelligent_chapter_detection(
+            provider_id,
+            model_id,
+            vosk_terms,
+            minimum_pause_seconds,
+            post_pause_seconds,
+            vosk_clip_length,
+            use_llm,
+            comparison_mode=True,
+        )
+        if self._intelligent_validation_result is None:
+            raise ProcessingError("Intelligent chapter detection did not produce a result")
+
+        if validate_references:
+            self._notify_progress(
+                Step.REFERENCE_VALIDATION,
+                0,
+                "Intelligent detection complete; validating chapter references…",
+                {"phase": "references"},
+            )
+            await self.validate_chapter_references(
+                provider_id,
+                model_id,
+                vosk_terms,
+                vosk_clip_length,
+                origin_step=Step.INTELLIGENT_CHAPTER_DETECTION,
+                initial_results=[self._intelligent_validation_result],
+                use_llm=use_llm,
+            )
+            return
+
+        self._reference_validation_origin = Step.INTELLIGENT_CHAPTER_DETECTION
+        self._reference_validation_results = [self._intelligent_validation_result]
+        self._notify_progress(
+            Step.REFERENCE_VALIDATION_RESULTS,
+            100,
+            "Intelligent Chapter Detection results are ready",
+        )
+
+    @property
+    def reference_validation_origin(self) -> Optional[Step]:
+        """Return the interactive page that launched the current reference validation."""
+        return self._reference_validation_origin
+
+    async def prepare_reference_for_transcription(self, reference_id: str) -> None:
+        """Use a validated chapter reference as the complete transcription cue list."""
+        if self.step != Step.REFERENCE_VALIDATION_RESULTS:
+            raise ValueError("Chapter reference validation results are not ready")
+        validated_ids = {result.id for result in self._reference_validation_results}
+        if reference_id not in validated_ids:
+            raise ValueError("Choose one of the validated chapter references")
+        if reference_id == INTELLIGENT_DETECTION_RESULT_ID:
+            result = next(
+                result for result in self._reference_validation_results if result.id == INTELLIGENT_DETECTION_RESULT_ID
+            )
+            self.cues = self._filter_cues_by_duration(
+                sorted({0.0, *(chapter.timestamp for chapter in result.chapters if chapter.valid)})
+            )
+            if not self.cues:
+                raise ValueError("Intelligent chapter detection did not retain any usable timestamps")
+            self._notify_progress(
+                Step.CONFIGURE_ASR,
+                0,
+                f"Ready to transcribe {len(self.cues)} titles from Intelligent Chapter Detection",
+            )
+            return
+
+        chapter_ref = self._get_chapter_ref(reference_id)
+        if chapter_ref is None:
+            raise ValueError(f"Invalid Chapter Reference: {reference_id}")
+
+        self.cues = self._filter_cues_by_duration([chapter.timestamp for chapter in chapter_ref.chapters])
+        if not self.cues:
+            raise ValueError("The selected chapter reference has no usable timestamps")
+        self._notify_progress(
+            Step.CONFIGURE_ASR,
+            0,
+            f"Ready to transcribe {len(self.cues)} titles from {chapter_ref.name}",
+        )
 
     async def _extract_audio_segments(self, preassigned_titles: Optional[Dict[int, str]] = None):
         """Extract audio segments for transcription, skipping cues with preassigned titles"""
@@ -2455,15 +2919,26 @@ class ProcessingPipeline:
         match self.step:
             case Step.SELECT_WORKFLOW:
                 restart_options.append(RestartStep.IDLE)
-            case Step.INTELLIGENT_CHAPTER_DETECTION | Step.VOSK_ANALYSIS | Step.LLM_CANDIDATE_TRIAGE:
-                # Intelligent detection can run for a while. Keep the back menu
-                # available both on its configuration screen and while its Vosk/
-                # LLM stages are processing so the user can cancel and choose a
-                # different workflow or audiobook.
+            case (
+                Step.INTELLIGENT_CHAPTER_DETECTION
+                | Step.VOSK_ANALYSIS
+                | Step.LLM_CANDIDATE_TRIAGE
+                | Step.REFERENCE_VALIDATION
+            ):
+                # Vosk/LLM analysis can run for a while. Keep the back menu
+                # available so the user can cancel and choose another workflow
+                # or audiobook.
                 restart_options.append(RestartStep.IDLE)
                 restart_options.append(RestartStep.SELECT_WORKFLOW)
                 if self.initial_chapter_selection_available:
                     restart_options.append(RestartStep.INITIAL_CHAPTER_SELECTION)
+            case Step.REFERENCE_VALIDATION_RESULTS:
+                restart_options.append(RestartStep.IDLE)
+                restart_options.append(RestartStep.SELECT_WORKFLOW)
+                if self.initial_chapter_selection_available:
+                    restart_options.append(RestartStep.INITIAL_CHAPTER_SELECTION)
+                if intelligent_detection_available:
+                    restart_options.append(RestartStep.INTELLIGENT_CHAPTER_DETECTION)
             case Step.INITIAL_CHAPTER_SELECTION:
                 restart_options.append(RestartStep.IDLE)
                 restart_options.append(RestartStep.SELECT_WORKFLOW)

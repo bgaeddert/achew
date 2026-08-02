@@ -13,13 +13,14 @@
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 
   import { DetectionMode } from '../types/enums';
-  import type { ChapterReference } from '../types/references';
+  import type { ChapterReference, ReferenceValidationResult } from '../types/references';
   import { formatDuration } from '../utils/format';
   import Clock from '@lucide/svelte/icons/clock';
 
   interface LocalChapterRow {
     timestamp: number;
     title: string;
+    headings?: string;
     [key: string]: unknown;
   }
 
@@ -37,6 +38,7 @@
     { value: DetectionMode.DRAMATIZED, label: 'Dramatized' },
   ];
   let chapterRefs = $state<ChapterReference[]>([]);
+  let referenceVoskResults = $state<ReferenceValidationResult[]>([]);
   let error = $state<string | null>(null);
 
   let showAddReference = $state(false);
@@ -92,6 +94,23 @@
     }
   });
 
+  onMount(async () => {
+    try {
+      const response = await api.session.getReferenceVoskResults();
+      referenceVoskResults = response.references;
+    } catch (error) {
+      console.warn('Failed to load automatic reference scores:', error);
+    }
+  });
+
+  function referenceDetectedPercentage(referenceId: string): number | null {
+    const result = referenceVoskResults.find((reference) => reference.id === referenceId);
+    if (!result) return null;
+    if (result.chapters.length === 0) return 0;
+    const validCount = result.chapters.filter((chapter) => chapter.valid).length;
+    return Math.round((validCount / result.chapters.length) * 100);
+  }
+
   async function proceedWithSelection() {
     loading = true;
     try {
@@ -136,6 +155,14 @@
     try {
       // Find the reference in chapterRefs
       const ref = chapterRefs.find((s) => s.id === refId);
+      const voskResult = referenceVoskResults.find((result) => result.id === refId);
+      if (voskResult) {
+        return voskResult.chapters.map((chapter, index) => ({
+          timestamp: chapter.timestamp,
+          title: chapter.title || `Chapter ${index + 1}`,
+          headings: chapter.headings,
+        }));
+      }
       if (ref && ref.chapters) {
         return ref.chapters.map((chapter, index) => ({
           timestamp: chapter.timestamp,
@@ -190,12 +217,11 @@
       description: 'Unknown option',
     };
   }
-
-  onMount(async () => {});
 </script>
 
 {#snippet referenceCard(ref: ChapterReference, groupName: string, selectedId: string, onSelect: (id: string) => void)}
   {@const delta = durationDeltaLabel(ref.duration)}
+  {@const percentDetected = referenceDetectedPercentage(ref.id)}
   <div class="option-card" class:selected={selectedId === ref.id}>
     <label>
       <div class="option-layout">
@@ -222,6 +248,14 @@
                 <span class="chapter-count">
                   <Clock size="12" />
                   {delta}
+                </span>
+              {/if}
+              {#if percentDetected !== null}
+                <span
+                  class="chapter-count percentage-valid"
+                  use:tooltip={'Percentage of reference timestamps where a spoken heading was detected'}
+                >
+                  {percentDetected}% detected
                 </span>
               {/if}
             </div>
@@ -525,6 +559,7 @@
   durationDelta={chapterModalDurationDelta}
   chapters={chapterModalData}
   loading={chapterModalLoading}
+  showValidationStatus={false}
   onclose={closeChapterModal}
 />
 
@@ -643,6 +678,10 @@
     transform: translateY(0);
   }
 
+  .chapter-count.percentage-valid {
+    color: var(--success);
+  }
+
   .chapter-count-container {
     display: flex;
     align-items: center;
@@ -735,8 +774,8 @@
     display: flex;
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    width: fit-content;
-    min-width: 620px;
+    width: 100%;
+    max-width: 800px;
     margin-left: auto;
     margin-right: auto;
     overflow: hidden;

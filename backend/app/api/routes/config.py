@@ -9,12 +9,14 @@ from pydantic import BaseModel
 from ...app import get_app_state
 from ...core.config import (
     ABSConfig,
+    IntelligentDetectionSettings,
     LLMProviderConfig,
     get_app_config,
     get_user_preferences,
     refresh_app_config,
     save_abs_config,
     save_llm_provider_config,
+    update_app_config,
     update_user_preferences,
 )
 from ...models.enums import Step
@@ -71,6 +73,11 @@ class ASRPreferencesResponse(BaseModel):
     current_variant: str
     current_language: str
     book_language: Optional[str] = None
+
+
+class IntelligentDetectionSettingsRequest(IntelligentDetectionSettings):
+    provider_id: str = ""
+    model_id: str = ""
 
 
 async def validate_abs_connection(abs_url: str, abs_api_key: str) -> Dict[str, Any]:
@@ -460,6 +467,23 @@ async def set_asr_preferences(request: ASRPreferenceRequest):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to save ASR preferences: {str(e)}")
+
+
+@router.put("/intelligent-detection/settings", response_model=IntelligentDetectionSettingsRequest)
+async def update_intelligent_detection_settings(request: IntelligentDetectionSettingsRequest):
+    """Persist defaults shared by the intelligent detection workflow and settings page."""
+    try:
+        config = get_app_config()
+        config.intelligent_detection = IntelligentDetectionSettings(**request.model_dump())
+        config.llm.last_used_provider = request.provider_id
+        config.llm.last_used_model = request.model_id
+        if not update_app_config(config):
+            raise HTTPException(status_code=500, detail="Failed to save intelligent detection settings")
+        return request
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to save intelligent detection settings: {str(e)}")
 
 
 # New LLM Provider endpoints

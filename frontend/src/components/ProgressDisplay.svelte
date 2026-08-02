@@ -63,12 +63,17 @@
     },
     vosk_analysis: {
       title: 'Checking Spoken Headings',
-      description: 'Analyzing short audio regions locally with Vosk…',
+      description: 'Analyzing short audio regions locally…',
       icon: AudioLines,
     },
     llm_candidate_triage: {
       title: 'Reviewing Chapter Candidates',
-      description: 'Local Vosk analysis is complete. Waiting for the selected LLM provider (up to 2 minutes)…',
+      description: 'Local audio analysis is complete. Waiting for the selected LLM provider (up to 2 minutes)…',
+      icon: Sparkles,
+    },
+    reference_validation: {
+      title: 'Checking Chapter References',
+      description: 'Analyzing spoken headings near each reference timestamp…',
       icon: Sparkles,
     },
     partial_scan_prep: {

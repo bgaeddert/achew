@@ -15,6 +15,8 @@ export const Step = {
   INTELLIGENT_CHAPTER_DETECTION: 'intelligent_chapter_detection',
   VOSK_ANALYSIS: 'vosk_analysis',
   LLM_CANDIDATE_TRIAGE: 'llm_candidate_triage',
+  REFERENCE_VALIDATION: 'reference_validation',
+  REFERENCE_VALIDATION_RESULTS: 'reference_validation_results',
   PARTIAL_SCAN_PREP: 'partial_scan_prep',
   PARTIAL_AUDIO_ANALYSIS: 'partial_audio_analysis',
   PARTIAL_VAD_ANALYSIS: 'partial_vad_analysis',

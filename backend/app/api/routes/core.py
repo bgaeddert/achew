@@ -312,3 +312,34 @@ async def complete_asr_setup():
     except Exception as e:
         logger.error(f"Failed to complete ASR setup: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/goto-intelligent-detection-setup")
+async def goto_intelligent_detection_setup():
+    """Open the standalone intelligent chapter detection settings screen."""
+    try:
+        app_state: AppState = get_app_state()
+        app_state.step = Step.INTELLIGENT_DETECTION_SETUP
+        await app_state.broadcast_step_change(Step.INTELLIGENT_DETECTION_SETUP)
+        return {"message": "Transitioned to intelligent detection setup", "step": Step.INTELLIGENT_DETECTION_SETUP.value}
+    except Exception as e:
+        logger.error(f"Failed to transition to intelligent detection setup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/complete-intelligent-detection-setup")
+async def complete_intelligent_detection_setup():
+    """Close intelligent chapter detection settings and restore the active session."""
+    try:
+        app_state = get_app_state()
+        if app_state.step != Step.INTELLIGENT_DETECTION_SETUP:
+            raise HTTPException(status_code=400, detail="Must be in intelligent detection setup to complete")
+
+        app_state.step = None
+        await app_state.broadcast_step_change(Step.IDLE)
+        return {"message": "Intelligent detection setup completed", "step": Step.IDLE.value}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to complete intelligent detection setup: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

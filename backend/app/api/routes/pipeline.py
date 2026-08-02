@@ -6,12 +6,12 @@ from typing import Dict, List, Literal, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
-from app.models.references import ChapterReference, TitleReference
-from app.services.processing_pipeline import PipelineProgress
+from app.models.references import ChapterReference, ReferenceValidationResult, TitleReference
+from app.services.processing_pipeline import PipelineProgress, ProcessingPipeline
 from app.services.vosk_candidate_service import TERMS, is_vosk_available
 
 from ...app import get_app_state
-from ...core.config import get_settings, is_abs_configured
+from ...core.config import get_app_config, get_settings, is_abs_configured, save_llm_config
 from ...models.abs import AudioInfo, Book
 from ...models.enums import DetectionMode, RestartStep, Step
 
@@ -68,16 +68,47 @@ class IntelligentChapterDetectionRequest(BaseModel):
     vosk_terms: List[str] = []
     minimum_pause_seconds: float = 2.0
     post_pause_seconds: float = 1.0
+    vosk_clip_length: float = 3.0
+    llm_triage: bool = True
+    view_results: bool = False
+    validate_references: bool = False
 
 
 class IntelligentChapterDetectionOptionsResponse(BaseModel):
     base_terms: List[str]
     chapter_refs: List[ChapterReference]
+    vosk_terms: List[str]
+    minimum_pause_seconds: float
+    post_pause_seconds: float
+    vosk_clip_length: float
+    quick_validate: bool
+    llm_processing: bool
+    provider_id: str
+    model_id: str
+
+
+class ReferenceValidationResultsResponse(BaseModel):
+    references: List[ReferenceValidationResult]
+
+
+class ReferenceValidationTranscriptionRequest(BaseModel):
+    reference_id: str
 
 
 def _require_intelligent_chapter_detection() -> None:
     if not is_vosk_available():
         raise HTTPException(status_code=404, detail="Intelligent chapter detection is not available on this platform")
+
+
+def _save_llm_selection(pipeline: ProcessingPipeline, provider_id: str, model_id: str) -> None:
+    """Persist a pipeline's LLM picker selection using the shared AI preferences."""
+    config = get_app_config()
+    config.llm.last_used_provider = provider_id
+    config.llm.last_used_model = model_id
+    if not save_llm_config(config.llm):
+        raise HTTPException(status_code=500, detail="Failed to save LLM provider and model preference")
+    pipeline.ai_options.provider_id = provider_id
+    pipeline.ai_options.model_id = model_id
 
 
 class PipelineStateResponse(BaseModel):
@@ -93,6 +124,7 @@ class PipelineStateResponse(BaseModel):
     restart_options: List[str] = []
     audio_unsupported_codec: bool = False
     audio_info: Optional[AudioInfo] = None
+    intelligent_chapter_detection_available: bool = False
 
 
 @router.post("/pipeline", response_model=dict)
@@ -124,6 +156,7 @@ async def create_pipeline(request: CreatePipelineRequest, background_tasks: Back
                         "title_refs": pipeline.title_refs,
                         "audio_unsupported_codec": pipeline.audio_unsupported_codec,
                         "audio_info": pipeline.audio_info,
+                        "intelligent_chapter_detection_available": is_vosk_available(),
                     },
                 )
 
@@ -177,6 +210,7 @@ async def get_pipeline_state():
             restart_options=pipeline.get_restart_options(),
             audio_unsupported_codec=pipeline.audio_unsupported_codec,
             audio_info=pipeline.audio_info,
+            intelligent_chapter_detection_available=is_vosk_available(),
         )
 
     except HTTPException:
@@ -277,13 +311,26 @@ async def start_workflow(request: StartWorkflowRequest, background_tasks: Backgr
         if not app_state.pipeline:
             raise HTTPException(status_code=404, detail="Pipeline not found")
 
-        if app_state.step != Step.SELECT_WORKFLOW:
+        pipeline = app_state.pipeline
+        quick_edit_from_validation = (
+            app_state.step == Step.REFERENCE_VALIDATION_RESULTS and request.workflow == "quick_edit"
+        )
+        if app_state.step != Step.SELECT_WORKFLOW and not quick_edit_from_validation:
             raise HTTPException(
                 status_code=400,
                 detail="Pipeline must be in select_workflow step to select option",
             )
 
-        pipeline = app_state.pipeline
+        if quick_edit_from_validation:
+            validated_result = next(
+                (result for result in pipeline._reference_validation_results if result.id == request.ref_id),
+                None,
+            )
+            if validated_result is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Choose one of the validated results to quick edit",
+                )
 
         async def run_workflow():
             try:
@@ -373,11 +420,22 @@ async def get_intelligent_chapter_detection_options():
     _require_intelligent_chapter_detection()
     app_state = get_app_state()
     pipeline = app_state.pipeline
-    if not pipeline:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
-    if pipeline.step != Step.INTELLIGENT_CHAPTER_DETECTION:
+    if pipeline and app_state.step not in [Step.INTELLIGENT_CHAPTER_DETECTION, Step.INTELLIGENT_DETECTION_SETUP]:
         raise HTTPException(status_code=400, detail="Pipeline is not ready for intelligent chapter detection")
-    return IntelligentChapterDetectionOptionsResponse(base_terms=TERMS, chapter_refs=pipeline.chapter_refs)
+    config = get_app_config()
+    settings = config.intelligent_detection
+    return IntelligentChapterDetectionOptionsResponse(
+        base_terms=TERMS,
+        chapter_refs=pipeline.chapter_refs if pipeline else [],
+        vosk_terms=settings.vosk_terms,
+        minimum_pause_seconds=settings.minimum_pause_seconds,
+        post_pause_seconds=settings.post_pause_seconds,
+        vosk_clip_length=settings.vosk_clip_length,
+        quick_validate=settings.quick_validate,
+        llm_processing=settings.llm_processing,
+        provider_id=config.llm.last_used_provider,
+        model_id=config.llm.last_used_model,
+    )
 
 
 @router.get("/pipeline/intelligent-chapter-detection/llm-debug")
@@ -405,7 +463,7 @@ async def intelligent_chapter_detection(
     request: IntelligentChapterDetectionRequest,
     background_tasks: BackgroundTasks,
 ):
-    """Run or bypass the optional Vosk and LLM chapter-candidate triage step."""
+    """Run, bypass, or validate references with the optional Vosk/LLM workflow."""
     try:
         _require_intelligent_chapter_detection()
         app_state = get_app_state()
@@ -422,15 +480,7 @@ async def intelligent_chapter_detection(
         # Keep the picker consistent with AI cleanup: the last provider/model
         # selected for intelligent detection becomes the default next time the
         # page is opened, including after an LLM retry.
-        from ...core.config import get_app_config, save_llm_config
-
-        config = get_app_config()
-        config.llm.last_used_provider = request.provider_id
-        config.llm.last_used_model = request.model_id
-        if not save_llm_config(config.llm):
-            raise HTTPException(status_code=500, detail="Failed to save LLM provider and model preference")
-        pipeline.ai_options.provider_id = request.provider_id
-        pipeline.ai_options.model_id = request.model_id
+        _save_llm_selection(pipeline, request.provider_id, request.model_id)
 
         if request.action == "update_terms":
             terms = await pipeline.suggest_intelligent_vosk_terms(
@@ -443,13 +493,29 @@ async def intelligent_chapter_detection(
 
         async def run_detection():
             try:
-                await pipeline.run_intelligent_chapter_detection(
-                    request.provider_id,
-                    request.model_id,
-                    request.vosk_terms,
-                    request.minimum_pause_seconds,
-                    request.post_pause_seconds,
-                )
+                llm_processing = request.llm_triage
+                validate_references = request.validate_references
+                if request.view_results or validate_references:
+                    await pipeline.run_intelligent_detection_for_results(
+                        request.provider_id,
+                        request.model_id,
+                        request.vosk_terms,
+                        request.minimum_pause_seconds,
+                        request.post_pause_seconds,
+                        request.vosk_clip_length,
+                        use_llm=llm_processing,
+                        validate_references=validate_references,
+                    )
+                else:
+                    await pipeline.run_intelligent_chapter_detection(
+                        request.provider_id,
+                        request.model_id,
+                        request.vosk_terms,
+                        request.minimum_pause_seconds,
+                        request.post_pause_seconds,
+                        request.vosk_clip_length,
+                        use_llm=llm_processing,
+                    )
             except Exception as e:
                 logger.error("Intelligent chapter detection failed: %s", e, exc_info=True)
                 pipeline.step = Step.INTELLIGENT_CHAPTER_DETECTION
@@ -466,6 +532,54 @@ async def intelligent_chapter_detection(
     except Exception as e:
         logger.error("Failed to start intelligent chapter detection: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/pipeline/reference-validation/results",
+    response_model=ReferenceValidationResultsResponse,
+)
+async def get_reference_validation_results():
+    """Return read-only Vosk and LLM checks for each timed chapter reference."""
+    _require_intelligent_chapter_detection()
+    pipeline = get_app_state().pipeline
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.step not in {Step.REFERENCE_VALIDATION_RESULTS, Step.SELECT_WORKFLOW}:
+        raise HTTPException(status_code=400, detail="Chapter reference validation results are not ready")
+    return ReferenceValidationResultsResponse(references=pipeline._reference_validation_results)
+
+
+@router.get(
+    "/pipeline/reference-validation/vosk-results",
+    response_model=ReferenceValidationResultsResponse,
+)
+async def get_reference_vosk_results():
+    """Return the automatic Vosk-only scores shown on workflow reference cards."""
+    pipeline = get_app_state().pipeline
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.step != Step.SELECT_WORKFLOW:
+        raise HTTPException(status_code=400, detail="Chapter reference scores are not ready")
+    return ReferenceValidationResultsResponse(references=pipeline._reference_vosk_results)
+
+
+@router.post("/pipeline/reference-validation/results/transcribe")
+async def transcribe_validated_reference(request: ReferenceValidationTranscriptionRequest):
+    """Use every timestamp from one validated reference as the transcription cue list."""
+    _require_intelligent_chapter_detection()
+    pipeline = get_app_state().pipeline
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.step != Step.REFERENCE_VALIDATION_RESULTS:
+        raise HTTPException(status_code=400, detail="Chapter reference validation results are not ready")
+    try:
+        await pipeline.prepare_reference_for_transcription(request.reference_id)
+        return {
+            "message": "Reference chapters are ready for transcription",
+            "reference_id": request.reference_id,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/pipeline/open-intelligent-chapter-detection")
@@ -702,7 +816,7 @@ async def cancel_step(request: Optional[CancelStepRequest] = None):
 
         step = pipeline.step
         expected_step = request.expected_step if request else None
-        intelligent_steps = [Step.VOSK_ANALYSIS, Step.LLM_CANDIDATE_TRIAGE]
+        intelligent_steps = [Step.VOSK_ANALYSIS, Step.LLM_CANDIDATE_TRIAGE, Step.REFERENCE_VALIDATION]
 
         if step in [Step.VALIDATING, Step.DOWNLOADING]:
             success = await app_state.delete_pipeline()
@@ -720,8 +834,11 @@ async def cancel_step(request: Optional[CancelStepRequest] = None):
 
         elif step in intelligent_steps or (
             expected_step in intelligent_steps
-            and step == Step.CONFIGURE_ASR
-            and pipeline._intelligent_vosk_evidence is not None
+            and (
+                (step == Step.CONFIGURE_ASR and pipeline._intelligent_vosk_evidence is not None)
+                or step == Step.REFERENCE_VALIDATION_RESULTS
+                or (step == Step.SELECT_WORKFLOW and pipeline.reference_validation_origin == Step.SELECT_WORKFLOW)
+            )
         ):
             # Intelligent detection is optional and sits on top of a completed
             # silence scan.  Cancelling it must preserve that scan and return
@@ -730,6 +847,22 @@ async def cancel_step(request: Optional[CancelStepRequest] = None):
             # before this request reaches the backend.
             app_state.progress_dispatcher.increment_epoch()
             await pipeline.cancel_processing()
+            if (
+                step in {Step.REFERENCE_VALIDATION, Step.SELECT_WORKFLOW}
+                and pipeline.reference_validation_origin == Step.SELECT_WORKFLOW
+            ):
+                pipeline._reference_vosk_results = []
+                pipeline._notify_progress(
+                    Step.SELECT_WORKFLOW,
+                    0,
+                    "Reference scan cancelled",
+                )
+                return {
+                    "message": "Reference scan cancelled, returned to workflow selection",
+                    "action": "restarted",
+                    "restart_step": Step.SELECT_WORKFLOW.value,
+                }
+
             await pipeline._transition_to_intelligent_chapter_detection()
             return {
                 "message": "Intelligent chapter detection cancelled, returned to its configuration",

@@ -32,6 +32,7 @@ export interface StepChangeData {
   restart_options?: string[];
   audio_unsupported_codec?: boolean;
   audio_info?: AudioInfo | null;
+  intelligent_chapter_detection_available?: boolean;
   chapter_id?: string;
   open_tab?: string;
 }

@@ -11,7 +11,8 @@
   interface ChapterRow {
     timestamp?: number | string | null;
     title?: string;
-    [key: string]: unknown;
+    headings?: string;
+    valid?: boolean;
   }
 
   interface Props {
@@ -21,6 +22,8 @@
     durationDelta?: string | null;
     chapters?: ChapterRow[];
     loading?: boolean;
+    headingsOnly?: boolean;
+    showValidationStatus?: boolean;
     onclose?: () => void;
   }
 
@@ -31,6 +34,8 @@
     durationDelta,
     chapters = [],
     loading = false,
+    headingsOnly = false,
+    showValidationStatus = true,
     onclose,
   }: Props = $props();
 
@@ -69,7 +74,9 @@
     }
   }
 
-  let hasTiming = $derived(chapters.some((ch) => ch.timestamp != null && ch.timestamp !== ''));
+  let displayedChapters = $derived(headingsOnly ? chapters.filter((chapter) => chapter.valid) : chapters);
+  let hasTiming = $derived(displayedChapters.some((ch) => ch.timestamp != null && ch.timestamp !== ''));
+  let hasValidation = $derived(!headingsOnly && displayedChapters.some((ch) => 'headings' in ch || 'valid' in ch));
 
   $effect(() => {
     if (dialog) {
@@ -88,7 +95,7 @@
   }
 </script>
 
-<dialog bind:this={dialog} onclick={handleDialogClick} onclose={closeModal}>
+<dialog bind:this={dialog} onclick={handleDialogClick} onclose={closeModal} class:validation={hasValidation}>
   <div class="modal-container">
     <div class="modal-header">
       <div class="modal-title-group">
@@ -113,20 +120,35 @@
           <div class="spinner"></div>
           <p>Loading chapter data…</p>
         </div>
-      {:else if chapters.length === 0}
+      {:else if displayedChapters.length === 0}
         <div class="empty-state">
           <CircleQuestionMark size="48" color="var(--text-secondary)" />
           <p>No chapter data available</p>
         </div>
       {:else}
-        <div class="chapters-list" class:title-only={!hasTiming}>
+        <div
+          class="chapters-list"
+          class:title-only={!hasTiming}
+          class:validation={hasValidation}
+          class:detected-only={hasValidation && !showValidationStatus}
+        >
           <div class="chapter-header">
             {#if hasTiming}
               <span class="header-time">Timestamp</span>
             {/if}
-            <span class="header-title">Chapter Title</span>
+            {#if !headingsOnly}
+              <span class="header-title">Chapter Title</span>
+            {/if}
+            {#if headingsOnly}
+              <span class="header-headings">Detected</span>
+            {:else if hasValidation}
+              <span class="header-headings">Detected</span>
+              {#if showValidationStatus}
+                <span class="header-valid">Valid</span>
+              {/if}
+            {/if}
           </div>
-          {#each chapters as chapter, index}
+          {#each displayedChapters as chapter, index}
             <div class="chapter-row">
               {#if hasTiming}
                 <div class="chapter-time-container">
@@ -148,7 +170,17 @@
                   <span class="chapter-time">{formatTime(Number(chapter.timestamp))}</span>
                 </div>
               {/if}
-              <span class="chapter-title">{chapter.title || `Chapter ${index + 1}`}</span>
+              {#if !headingsOnly}
+                <span class="chapter-title">{chapter.title || `Chapter ${index + 1}`}</span>
+              {/if}
+              {#if headingsOnly}
+                <span class="chapter-headings">{chapter.headings || ''}</span>
+              {:else if hasValidation}
+                <span class="chapter-headings">{chapter.headings || ''}</span>
+                {#if showValidationStatus}
+                  <span class="chapter-valid">{chapter.valid ? 'Valid' : ''}</span>
+                {/if}
+              {/if}
             </div>
           {/each}
         </div>
@@ -166,6 +198,10 @@
     max-width: 90vw;
     max-height: 90vh;
     width: 600px;
+  }
+
+  dialog.validation {
+    width: 900px;
   }
 
   dialog::backdrop {
@@ -324,6 +360,18 @@
     grid-template-columns: 1fr;
   }
 
+  .chapters-list.validation .chapter-header,
+  .chapters-list.validation .chapter-row {
+    grid-template-columns: 120px minmax(160px, 1fr) minmax(160px, 1fr) 70px;
+    min-width: 700px;
+  }
+
+  .chapters-list.detected-only .chapter-header,
+  .chapters-list.detected-only .chapter-row {
+    grid-template-columns: 120px minmax(160px, 1fr) minmax(160px, 1fr);
+    min-width: 600px;
+  }
+
   .chapter-row {
     display: grid;
     grid-template-columns: 120px 1fr;
@@ -386,8 +434,22 @@
     white-space: nowrap;
   }
 
+  .chapter-headings {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    overflow-wrap: anywhere;
+  }
+
+  .chapter-valid {
+    color: var(--success);
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
   .header-time,
-  .header-title {
+  .header-title,
+  .header-headings,
+  .header-valid {
     font-size: 0.75rem;
   }
 

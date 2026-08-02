@@ -1,6 +1,6 @@
 import type { AudioInfo, Book } from './book';
 import type { BasicChapter, ChapterData, SelectionStats } from './chapter';
-import type { ChapterReference, TitleReference } from './references';
+import type { ChapterReference, ReferenceValidationResult, TitleReference } from './references';
 import type { TidyOptions } from '../utils/titleTools';
 
 export interface ProgressState {
@@ -23,15 +23,39 @@ export interface PipelineState {
   restart_options?: string[];
   audio_unsupported_codec?: boolean;
   audio_info?: AudioInfo | null;
+  intelligent_chapter_detection_available?: boolean;
 }
 
 export interface IntelligentChapterDetectionOptions {
   base_terms: string[];
   chapter_refs: ChapterReference[];
+  vosk_terms: string[];
+  minimum_pause_seconds: number;
+  post_pause_seconds: number;
+  vosk_clip_length: number;
+  quick_validate: boolean;
+  llm_processing: boolean;
+  provider_id: string;
+  model_id: string;
+}
+
+export interface IntelligentDetectionSettings {
+  provider_id: string;
+  model_id: string;
+  vosk_terms: string[];
+  minimum_pause_seconds: number;
+  post_pause_seconds: number;
+  vosk_clip_length: number;
+  quick_validate: boolean;
+  llm_processing: boolean;
 }
 
 export interface IntelligentChapterDetectionTermsResponse {
   terms: string[];
+}
+
+export interface ReferenceValidationResultsResponse {
+  references: ReferenceValidationResult[];
 }
 
 export interface IntelligentChapterDetectionDebugResponse {

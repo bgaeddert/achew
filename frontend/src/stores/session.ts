@@ -36,6 +36,7 @@ export interface SessionState {
   titleRefs: TitleReference[];
   audioUnsupportedCodec: boolean;
   audioInfo: AudioInfo | null;
+  intelligentChapterDetectionAvailable: boolean;
   restartOptions: string[];
   transcriptionStatuses: Record<string, string>;
   version: string | null;
@@ -69,6 +70,7 @@ function initialState(): SessionState {
     titleRefs: [],
     audioUnsupportedCodec: false,
     audioInfo: null,
+    intelligentChapterDetectionAvailable: false,
     restartOptions: [],
     transcriptionStatuses: {},
     version: null,
@@ -116,6 +118,9 @@ function createSessionStore() {
             audioUnsupportedCodec: data.audio_unsupported_codec,
           }),
           ...(data.audio_info !== undefined && { audioInfo: data.audio_info }),
+          ...(data.intelligent_chapter_detection_available !== undefined && {
+            intelligentChapterDetectionAvailable: data.intelligent_chapter_detection_available,
+          }),
         }));
         if (data.new_step === 'chapter_editing' && data.chapter_id) {
           pendingAddChapterDialog.set({
@@ -257,6 +262,7 @@ function createSessionStore() {
           restartOptions: data.restart_options ?? [],
           audioUnsupportedCodec: data.audio_unsupported_codec ?? false,
           audioInfo: data.audio_info ?? null,
+          intelligentChapterDetectionAvailable: data.intelligent_chapter_detection_available ?? false,
           loading: false,
         }));
 

@@ -136,6 +136,14 @@ class CandidateEvidence:
     words: List[VoskWord]
 
 
+def group_vosk_utterances(words: Iterable[VoskWord]) -> List[List[VoskWord]]:
+    """Group recognized terms by finalized Vosk utterance in chronological order."""
+    grouped: Dict[int, List[VoskWord]] = {}
+    for word in words:
+        grouped.setdefault(word.utterance, []).append(word)
+    return sorted(grouped.values(), key=lambda utterance: utterance[0].start)
+
+
 def is_vosk_available() -> bool:
     """Return whether Vosk-backed intelligent detection can run here."""
     return sys.platform != "darwin" and importlib.util.find_spec("vosk") is not None
@@ -172,9 +180,11 @@ def _get_model() -> Any:
         return _model
 
 
-def _merged_windows(anchors: Sequence[float], duration: float) -> List[Tuple[float, float]]:
+def _merged_windows(
+    anchors: Sequence[float], duration: float, after_seconds: float = GATE_AFTER_SECONDS
+) -> List[Tuple[float, float]]:
     windows = sorted(
-        (max(0.0, anchor - GATE_BEFORE_SECONDS), min(duration, anchor + GATE_AFTER_SECONDS)) for anchor in anchors
+        (max(0.0, anchor - GATE_BEFORE_SECONDS), min(duration, anchor + after_seconds)) for anchor in anchors
     )
     merged: List[Tuple[float, float]] = []
     for start, end in windows:
@@ -194,11 +204,13 @@ class VoskCandidateService:
         running_processes: Optional[list] = None,
         process_lock: Optional[threading.Lock] = None,
         terms: Optional[Iterable[str]] = None,
+        after_seconds: float = GATE_AFTER_SECONDS,
     ) -> None:
         self.progress_callback = progress_callback
         self._running_processes = running_processes if running_processes is not None else []
         self._process_lock = process_lock or threading.Lock()
         self.terms = normalize_vosk_terms(terms if terms is not None else TERMS)
+        self.after_seconds = after_seconds
 
     def _notify(self, percent: float, message: str, details: Optional[Dict[str, Any]] = None) -> None:
         self.progress_callback(Step.VOSK_ANALYSIS, percent, message, details or {})
@@ -303,7 +315,7 @@ class VoskCandidateService:
         anchors: Sequence[float],
         cancelled: threading.Event,
     ) -> List[CandidateEvidence]:
-        windows = _merged_windows(anchors, duration)
+        windows = _merged_windows(anchors, duration, self.after_seconds)
         if not windows:
             return [CandidateEvidence(timestamp=anchor, words=[]) for anchor in anchors]
 
@@ -361,7 +373,7 @@ class VoskCandidateService:
                     for (start, end), result in zip(windows, window_words)
                     if start <= anchor <= end
                     for word in (result or [])
-                    if anchor - GATE_BEFORE_SECONDS <= word.start <= anchor + GATE_AFTER_SECONDS
+                    if anchor - GATE_BEFORE_SECONDS <= word.start <= anchor + self.after_seconds
                 ],
             )
             for anchor in anchors

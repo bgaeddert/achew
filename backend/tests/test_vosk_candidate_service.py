@@ -133,6 +133,22 @@ def test_parallel_scan_bounds_workers_and_preserves_time_order(monkeypatch):
     assert all(details["worker_count"] == 2 for _, _, details in progress)
 
 
+def test_custom_clip_length_extends_only_after_the_timecode(monkeypatch):
+    windows = []
+    service = VoskCandidateService(lambda *args, **kwargs: None, after_seconds=8.0)
+
+    def fake_scan_window(_audio_file, start, end, _cancelled):
+        windows.append((start, end))
+        return [VoskWord(word="chapter", start=17.5, end=17.7, confidence=0.9)]
+
+    monkeypatch.setattr(service, "_scan_window", fake_scan_window)
+
+    evidence = service._scan("book.m4b", 100.0, [10.0], threading.Event())
+
+    assert windows == [(9.5, 18.0)]
+    assert [word.word for word in evidence[0].words] == ["chapter"]
+
+
 def test_cancelled_scan_does_not_start_a_vosk_decoder(monkeypatch):
     """A queued worker observes cancellation before loading Vosk or ffmpeg."""
     service = VoskCandidateService(lambda *args, **kwargs: None)

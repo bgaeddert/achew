@@ -23,6 +23,8 @@ import type {
   IntelligentChapterDetectionDebugResponse,
   IntelligentChapterDetectionOptions,
   IntelligentChapterDetectionTermsResponse,
+  IntelligentDetectionSettings,
+  ReferenceValidationResultsResponse,
   ChapterReference,
   LLMModelsResponse,
   LLMProviderResponse,
@@ -168,6 +170,10 @@ export const session = {
       voskTerms?: string[];
       minimumPauseSeconds?: number;
       postPauseSeconds?: number;
+      voskClipLength?: number;
+      llmTriage?: boolean;
+      viewResults?: boolean;
+      validateReferences?: boolean;
     } = {},
   ) {
     return apiRequest<unknown>('/pipeline/intelligent-chapter-detection', {
@@ -180,6 +186,10 @@ export const session = {
         vosk_terms: options.voskTerms ?? [],
         minimum_pause_seconds: options.minimumPauseSeconds ?? 2,
         post_pause_seconds: options.postPauseSeconds ?? 1,
+        vosk_clip_length: options.voskClipLength ?? 3,
+        llm_triage: options.llmTriage ?? true,
+        view_results: options.viewResults ?? false,
+        validate_references: options.validateReferences ?? false,
       },
     });
   },
@@ -194,6 +204,21 @@ export const session = {
         reference_id: referenceId,
         vosk_terms: voskTerms,
       },
+    });
+  },
+
+  getReferenceValidationResults() {
+    return apiRequest<ReferenceValidationResultsResponse>('/pipeline/reference-validation/results');
+  },
+
+  getReferenceVoskResults() {
+    return apiRequest<ReferenceValidationResultsResponse>('/pipeline/reference-validation/vosk-results');
+  },
+
+  transcribeValidatedReference(referenceId: string) {
+    return apiRequest<unknown>('/pipeline/reference-validation/results/transcribe', {
+      method: 'POST',
+      body: { reference_id: referenceId },
     });
   },
 
@@ -502,6 +527,13 @@ export const config = {
     return apiRequest<unknown>('/asr/preferences', {
       method: 'POST',
       body: { service_id: serviceId, variant_id: variantId, language },
+    });
+  },
+
+  updateIntelligentDetectionSettings(settings: IntelligentDetectionSettings) {
+    return apiRequest<IntelligentDetectionSettings>('/intelligent-detection/settings', {
+      method: 'PUT',
+      body: settings as unknown as Record<string, unknown>,
     });
   },
 

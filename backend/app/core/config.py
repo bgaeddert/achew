@@ -65,6 +65,17 @@ class ASROptions(BaseModel):
     segment_length: float = 8.0
 
 
+class IntelligentDetectionSettings(BaseModel):
+    """Saved defaults for intelligent chapter detection and quick validation."""
+
+    vosk_terms: List[str] = Field(default_factory=list)
+    minimum_pause_seconds: float = 2.0
+    post_pause_seconds: float = 1.0
+    vosk_clip_length: float = 3.0
+    quick_validate: bool = True
+    llm_processing: bool = True
+
+
 class EditorSettings(BaseModel):
     """Chapter editor settings"""
 
@@ -108,6 +119,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig = LLMConfig()
     user_preferences: UserPreferences = UserPreferences()
     asr_options: ASROptions = ASROptions()
+    intelligent_detection: IntelligentDetectionSettings = IntelligentDetectionSettings()
     custom_instructions: CustomInstructionsConfig = CustomInstructionsConfig()
 
 
@@ -168,6 +180,9 @@ def load_config() -> AppConfig:
                 if data.get("user_preferences")
                 else UserPreferences(),
                 asr_options=ASROptions(**data["asr_options"]) if data.get("asr_options") else ASROptions(),
+                intelligent_detection=IntelligentDetectionSettings(**data["intelligent_detection"])
+                if data.get("intelligent_detection")
+                else IntelligentDetectionSettings(),
                 custom_instructions=CustomInstructionsConfig(**data["custom_instructions"])
                 if data.get("custom_instructions")
                 else CustomInstructionsConfig(),
@@ -189,6 +204,7 @@ def save_config(config: AppConfig) -> bool:
             "llm": config.llm.model_dump(mode="json"),
             "user_preferences": config.user_preferences.model_dump(mode="json"),
             "asr_options": config.asr_options.model_dump(mode="json"),
+            "intelligent_detection": config.intelligent_detection.model_dump(mode="json"),
             "custom_instructions": config.custom_instructions.model_dump(mode="json"),
         }
 

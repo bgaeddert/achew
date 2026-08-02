@@ -1,6 +1,6 @@
 import uuid
 from enum import Enum
-from typing import Dict, List, Union
+from typing import Dict, List, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +36,17 @@ class ReferenceBase(BaseModel):
 class ChapterReference(ReferenceBase):
     type: ChapterRefType
     chapters: List[BasicChapter]
+    duration: float
+
+
+class ReferenceValidationChapter(BasicChapter):
+    headings: str = ""
+    valid: bool = False
+
+
+class ReferenceValidationResult(ReferenceBase):
+    type: Union[ChapterRefType, Literal["intelligent_detection"]]
+    chapters: List[ReferenceValidationChapter]
     duration: float
 
 

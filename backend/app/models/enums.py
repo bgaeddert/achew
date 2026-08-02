@@ -7,6 +7,7 @@ class Step(str, Enum):
     ABS_SETUP = "abs_setup"  # Interactive
     LLM_SETUP = "llm_setup"  # Interactive
     ASR_SETUP = "asr_setup"  # Interactive
+    INTELLIGENT_DETECTION_SETUP = "intelligent_detection_setup"  # Interactive
     IDLE = "idle"  # Interactive
     VALIDATING = "validating"
     DOWNLOADING = "downloading"
@@ -18,6 +19,8 @@ class Step(str, Enum):
     INTELLIGENT_CHAPTER_DETECTION = "intelligent_chapter_detection"  # Interactive
     VOSK_ANALYSIS = "vosk_analysis"
     LLM_CANDIDATE_TRIAGE = "llm_candidate_triage"
+    REFERENCE_VALIDATION = "reference_validation"
+    REFERENCE_VALIDATION_RESULTS = "reference_validation_results"  # Interactive
     PARTIAL_SCAN_PREP = "partial_scan_prep"
     PARTIAL_AUDIO_ANALYSIS = "partial_audio_analysis"
     PARTIAL_VAD_ANALYSIS = "partial_vad_analysis"

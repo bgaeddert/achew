@@ -15,10 +15,12 @@
   import Connecting from './components/Connecting.svelte';
   import InitialChapterSelection from './components/InitialChapterSelection.svelte';
   import IntelligentChapterDetection from './components/IntelligentChapterDetection.svelte';
+  import IntelligentDetectionSetup from './components/IntelligentDetectionSetup.svelte';
   import FindBook from './components/FindBook.svelte';
   import Icon from './components/Icon.svelte';
   import LLMSetup from './components/LLMSetup.svelte';
   import ProgressDisplay from './components/ProgressDisplay.svelte';
+  import ReferenceValidationResults from './components/ReferenceValidationResults.svelte';
   import SelectWorkflow from './components/SelectWorkflow.svelte';
   import SubmitSuccess from './components/SubmitSuccess.svelte';
   import Welcome from './components/Welcome.svelte';
@@ -100,9 +102,11 @@
     | 'abs_setup'
     | 'llm_setup'
     | 'asr_setup'
+    | 'intelligent_detection_setup'
     | 'progress'
     | 'select_workflow'
     | 'intelligent_chapter_detection'
+    | 'reference_validation_results'
     | 'initial_chapter_selection'
     | 'configure_asr'
     | 'chapter_editing'
@@ -125,6 +129,8 @@
         return 'llm_setup';
       case 'asr_setup':
         return 'asr_setup';
+      case 'intelligent_detection_setup':
+        return 'intelligent_detection_setup';
       case 'validating':
       case 'downloading':
       case 'file_prep':
@@ -133,6 +139,7 @@
       case 'vad_analysis':
       case 'vosk_analysis':
       case 'llm_candidate_triage':
+      case 'reference_validation':
       case 'partial_scan_prep':
       case 'partial_audio_analysis':
       case 'partial_vad_analysis':
@@ -144,6 +151,8 @@
         return 'select_workflow';
       case 'intelligent_chapter_detection':
         return 'intelligent_chapter_detection';
+      case 'reference_validation_results':
+        return 'reference_validation_results';
       case 'initial_chapter_selection':
         return 'initial_chapter_selection';
       case 'configure_asr':
@@ -311,7 +320,15 @@
   }
 
   function shouldShowRestartButton(_restartOptions: string[]): boolean {
-    return !['migration_failed', 'welcome', 'abs_setup', 'llm_setup', 'asr_setup', 'idle'].includes($session.step);
+    return ![
+      'migration_failed',
+      'welcome',
+      'abs_setup',
+      'llm_setup',
+      'asr_setup',
+      'intelligent_detection_setup',
+      'idle',
+    ].includes($session.step);
   }
 
   function shouldDisableRestartButton(restartOptions: string[]): boolean {
@@ -323,6 +340,8 @@
       'intelligent_chapter_detection',
       'vosk_analysis',
       'llm_candidate_triage',
+      'reference_validation',
+      'reference_validation_results',
       'initial_chapter_selection',
       'configure_asr',
       'chapter_editing',
@@ -393,9 +412,25 @@
     }
   }
 
+  async function gotoIntelligentDetectionSetup() {
+    closeSettingsMenu();
+    try {
+      const response = await fetch('/api/goto-intelligent-detection-setup', { method: 'POST' });
+      if (response.ok) {
+        await session.loadActiveSession();
+      } else {
+        console.error('Failed to navigate to intelligent detection setup');
+      }
+    } catch (error) {
+      console.error('Error navigating to intelligent detection setup:', error);
+    }
+  }
+
   let isConnectingView = $derived(currentView === 'connecting');
   let shouldShowSettings = $derived(
-    !['migration_failed', 'welcome', 'abs_setup', 'llm_setup', 'asr_setup'].includes($session.step) &&
+    !['migration_failed', 'welcome', 'abs_setup', 'llm_setup', 'asr_setup', 'intelligent_detection_setup'].includes(
+      $session.step,
+    ) &&
       !isConnectingView,
   );
 
@@ -499,6 +534,10 @@
                     <Mic size="16" color="var(--primary)" />
                     Transcription Settings
                   </button>
+                  <button class="settings-option" onclick={gotoIntelligentDetectionSetup} disabled={$session.loading}>
+                    <Workflow size="16" color="var(--primary)" />
+                    Intelligent Detection Settings
+                  </button>
                   <button class="settings-option" onclick={gotoLLMSetup} disabled={$session.loading}>
                     <Icon name="ai" size="16" color="var(--primary)" />
                     LLM Setup
@@ -564,12 +603,16 @@
         <LLMSetup onllmsetupcomplete={handleLLMSetupComplete} />
       {:else if currentView === 'asr_setup'}
         <ASRSetup onasrsetupcomplete={() => session.loadActiveSession()} />
+      {:else if currentView === 'intelligent_detection_setup'}
+        <IntelligentDetectionSetup onsettingscomplete={() => session.loadActiveSession()} />
       {:else if currentView === 'progress'}
         <ProgressDisplay />
       {:else if currentView === 'select_workflow'}
         <SelectWorkflow />
       {:else if currentView === 'intelligent_chapter_detection'}
         <IntelligentChapterDetection />
+      {:else if currentView === 'reference_validation_results'}
+        <ReferenceValidationResults />
       {:else if currentView === 'initial_chapter_selection'}
         <InitialChapterSelection />
       {:else if currentView === 'configure_asr'}
